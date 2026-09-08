@@ -2,9 +2,15 @@
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-  echo Please create the development virtual environment first.
+  echo Create .venv and install requirements-dev.txt first. See README.md.
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --name WTVB-Monitor --add-data "%CD%\app\static;app\static" --distpath release --workpath work\build --specpath work\spec launcher.py
-if errorlevel 1 pause
+".venv\Scripts\python.exe" scripts\build_release.py
+if errorlevel 1 (
+  echo Release build failed. Review the output above.
+  pause
+  exit /b 1
+)
+echo Release ZIP is in the release folder.
+pause

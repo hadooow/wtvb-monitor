@@ -23,11 +23,11 @@ def static_root() -> Path:
 @dataclass(slots=True)
 class Settings:
     gateway_driver: str = "simulator"
-    serial_port: str = "COM5"
+    serial_port: str = "COM3"
     baudrate: int = 115200
     max_connections: int = 5
     dwell_seconds: int = 180
-    connect_timeout_seconds: int = 20
+    connect_timeout_seconds: int = 40
     reconnect_base_seconds: int = 10
     focus_lease_seconds: int = 30
     persist_interval_seconds: int = 5

@@ -65,6 +65,7 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_samples_device_time
                     ON samples(device_id, timestamp DESC);
+                CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
                 """
             )
             count = connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
@@ -72,6 +73,7 @@ class Database:
                 now = datetime.now(timezone.utc).isoformat()
                 seed = [
                     ("F8C5C0B8917E", "CBF0-W31", "7-100", 0),
+                    ("C2372102DEEF", "CBF1-W31", "7-100", 0),
                     ("E358B14B81B5", "CBF2-W31", "7-100", 0),
                     ("E91470052EF9", "CBF3-W31", "7-100", 0),
                     ("D5E44E23860B", "CBF4-W31", "7-100", 0),
@@ -82,6 +84,15 @@ class Database:
                     "INSERT INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
                     [(mac, name, location, simulated, now) for mac, name, location, simulated in seed],
                 )
+            # Upgrade existing databases once; preserve user names/settings,
+            # and respect subsequent explicit deletion of CBF1.
+            migration = "v0.6.0-add-cbf1"
+            if not connection.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
+                connection.execute(
+                    "INSERT OR IGNORE INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
+                    ("C2372102DEEF", "CBF1-W31", "7-100", 0, datetime.now(timezone.utc).isoformat()),
+                )
+                connection.execute("INSERT INTO migrations(name) VALUES(?)", (migration,))
 
     def list_devices(self, include_simulated: bool = True) -> list[dict[str, Any]]:
         query = "SELECT * FROM devices"

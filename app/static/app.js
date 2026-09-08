@@ -26,6 +26,8 @@ function errorText(value) {
   if (!value) return "";
   const profile = value.includes(" | ") ? ` · 已尝试${value.split(" | ").slice(1).join(" | ")}` : "";
   if (value.includes("CNN_BUSY")) return `网关正忙，已自动排队重试${profile}`;
+  if (value.includes("AT_RESPONSE_TIMEOUT")) return "网关回复不完整，请下载日志并在采集设置中重新连接网关";
+  if (value.includes("AT_ERROR")) return `网关拒绝指令，请下载日志查看详情${profile}`;
   if (value.includes("TIMEOUT")) return `蓝牙连接超时${profile}`;
   if (value.includes("DISSCONNECT") && value.includes("34")) return `无线链路响应超时（BLE 34）${profile}`;
   if (value.includes("DISSCONNECT")) return `传感器主动断开或链路中断${profile}`;
@@ -56,13 +58,13 @@ function render() {
   const badge = $("#gatewayBadge");
   badge.textContent = gateway.error
     ? `网关异常 · ${errorText(gateway.error)}`
-    : `${gateway.name} · ${gateway.driver === "simulator" ? "模拟模式" : gateway.online ? "串口正常" : "串口未打开"}`;
+    : `${gateway.name} · ${gateway.driver === "simulator" ? "模拟模式" : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开 · 等待网关回复" : "串口已打开 · 已收到网关回复") : "串口未打开"}`;
   badge.classList.toggle("error", Boolean(gateway.error));
   const connected = devices.filter(device => device.runtime.status === "connected").length;
   $("#connectedCount").textContent = connected;
   $("#connectionLimit").textContent = `/ ${settings.max_connections} 路连接`;
   $("#deviceCount").textContent = devices.length;
-  $("#collectingCount").textContent = connected;
+  $("#collectingCount").textContent = devices.filter(device => device.runtime.collecting).length;
   $("#queuedCount").textContent = devices.filter(device => ["queued", "connecting", "disconnecting"].includes(device.runtime.status)).length;
   $("#errorCount").textContent = devices.filter(device => device.runtime.status === "retrying").length;
   renderCards(devices);
@@ -77,11 +79,12 @@ function renderCards(devices) {
   }
   grid.innerHTML = devices.map(device => {
     const runtime = device.runtime;
-    const live = runtime.status === "connected";
+    const live = Boolean(runtime.collecting);
     const sample = live ? runtime.latest : null;
     const alarm = live ? (runtime.alarm || { level: "normal", reasons: [] }) : { level: "normal", reasons: [] };
     const badgeClass = alarm.level !== "normal" ? alarm.level : runtime.status;
-    const badgeText = alarm.level === "alarm" ? "报警" : alarm.level === "warning" ? "预警" : runtime.is_focus && live ? "实时优先" : runtime.is_focus ? `${statusNames[runtime.status] || runtime.status} · 已优先` : statusNames[runtime.status] || runtime.status;
+    const connectionLabel = runtime.status === "connected" && !live ? "已连接 · 等待数据" : statusNames[runtime.status] || runtime.status;
+    const badgeText = alarm.level === "alarm" ? "报警" : alarm.level === "warning" ? "预警" : runtime.is_focus && live ? "实时优先" : runtime.is_focus ? `${connectionLabel} · 已优先` : connectionLabel;
     const alarmReason = alarm.reasons?.map(item => `${item.label} ${fmt(item.value)} ${item.unit}`).join(" · ") || "";
     const reason = alarmReason || (runtime.error ? `连接失败：${errorText(runtime.error)}` : "");
     const timeText = sample ? new Date(sample.timestamp).toLocaleTimeString() : live ? "等待数据" : "当前未采集";
@@ -147,7 +150,7 @@ function renderMonitor() {
   const device = state.dashboard?.devices.find(item => item.id === state.monitorDeviceId);
   if (!device) return;
   const runtime = device.runtime;
-  const live = runtime.status === "connected";
+  const live = Boolean(runtime.collecting);
   const sample = live ? runtime.latest : null;
   const focused = state.focusMac === device.mac;
   $("#monitorTitle").textContent = device.name;
@@ -179,9 +182,9 @@ function renderDiagnostics(runtime) {
   const rssi = runtime.rssi;
   const weak = rssi !== null && rssi !== undefined && rssi < -75;
   panel.innerHTML = `
-    <div><span>485 / USB 网关</span><strong>${gateway.online ? "串口通信正常" : "串口未打开"}</strong></div>
+    <div><span>485 / USB 网关</span><strong>${gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开，尚无回复" : `最近回复 ${gateway.last_response_seconds_ago} 秒前`) : "串口未打开"}</strong></div>
     <div class="${weak ? "weak" : ""}"><span>传感器广播</span><strong>${seen ? `已发现 · ${rssi ?? "—"} dBm${weak ? " · 信号弱" : ""}` : "尚未扫描到"}</strong></div>
-    <div class="${runtime.error ? "failed" : ""}"><span>BLE 数据连接</span><strong>${runtime.status === "connected" ? "已连接并接收数据" : runtime.status === "connecting" ? "正在建立连接" : errorText(runtime.error) || "等待连接"}</strong></div>`;
+    <div class="${runtime.error ? "failed" : ""}"><span>BLE 数据连接</span><strong>${runtime.status === "connected" ? (runtime.collecting ? "已连接并接收有效数据" : "已连接，等待有效数据") : runtime.status === "connecting" ? "正在建立连接" : escapeHtml(errorText(runtime.error)) || "等待连接"}</strong></div>`;
 }
 
 function renderAxisValues(elementId, sample, prefix, unit, digits) {
@@ -408,6 +411,8 @@ $("#settingsButton").addEventListener("click", () => {
   const values = state.dashboard.settings;
   form.gateway_driver.value = values.gateway_driver;
   form.serial_port.value = values.serial_port;
+  form.baudrate.value = values.baudrate;
+  form.connect_timeout_seconds.value = values.connect_timeout_seconds;
   form.max_connections.value = values.max_connections;
   form.dwell_minutes.value = values.dwell_seconds / 60;
   form.persist_interval_seconds.value = values.persist_interval_seconds;
@@ -422,6 +427,8 @@ $("#settingsForm").addEventListener("submit", async event => {
     await api("/api/settings", { method: "PATCH", body: JSON.stringify({
       gateway_driver: form.get("gateway_driver"),
       serial_port: form.get("serial_port"),
+      baudrate: Number(form.get("baudrate")),
+      connect_timeout_seconds: Number(form.get("connect_timeout_seconds")),
       max_connections: Number(form.get("max_connections")),
       dwell_seconds: Number(form.get("dwell_minutes")) * 60,
       persist_interval_seconds: Number(form.get("persist_interval_seconds")),
@@ -503,4 +510,17 @@ window.openDeviceSettings = openDeviceSettings;
 loadDashboard().then(connectSocket).catch(error => {
   $("#gatewayBadge").textContent = `页面加载失败 · ${error.message}`;
   $("#gatewayBadge").classList.add("error");
+});
+
+$("#downloadLogsButton").addEventListener("click", () => {
+  window.location.href = "/api/diagnostics/download";
+});
+$("#reconnectGatewayButton").addEventListener("click", async event => {
+  event.currentTarget.disabled = true;
+  try {
+    await api("/api/gateway/reconnect", { method: "POST" });
+    await loadDashboard();
+    $("#settingsDialog").close();
+  } catch (error) { alert(error.message); }
+  finally { $("#reconnectGatewayButton").disabled = false; }
 });

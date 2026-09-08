@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 import webbrowser
@@ -10,13 +11,14 @@ from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import Settings, project_root, static_root
 from .database import Database
 from .scheduler import Scheduler
+from .diagnostics import VERSION, configure_logging, diagnostic_archive
 
 
 class DeviceCreate(BaseModel):
@@ -37,6 +39,8 @@ class DeviceUpdate(BaseModel):
 class SettingsUpdate(BaseModel):
     gateway_driver: Literal["simulator", "serial"] | None = None
     serial_port: str | None = Field(None, min_length=3, max_length=20)
+    baudrate: int | None = Field(None, ge=1200, le=921600)
+    connect_timeout_seconds: int | None = Field(None, ge=5, le=60)
     max_connections: int | None = Field(None, ge=1, le=7)
     dwell_seconds: int | None = Field(None, ge=60, le=300)
     reconnect_base_seconds: int | None = Field(None, ge=5, le=600)
@@ -67,6 +71,7 @@ class SocketHub:
             self.disconnect(socket)
 
 
+configure_logging()
 settings = Settings.load()
 database = Database()
 hub = SocketHub()
@@ -80,7 +85,7 @@ async def lifespan(_: FastAPI):
     await scheduler.stop()
 
 
-app = FastAPI(title="工业无线温振监测系统", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="工业无线温振监测系统", version=VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=static_root()), name="static")
 
 
@@ -91,6 +96,27 @@ def index():
 
 @app.get("/health")
 def health():
+    return {"ok": True, "version": VERSION, "gateway": scheduler.snapshot()["gateway"]}
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    return {"version": VERSION, "log_path": str(project_root() / "logs" / "monitor.log"), "snapshot": scheduler.snapshot()}
+
+
+@app.get("/api/diagnostics/download")
+def download_diagnostics():
+    return Response(
+        diagnostic_archive(scheduler.snapshot(), settings.public_dict()),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="WTVB-diagnostics-v{VERSION}.zip"'},
+    )
+
+
+@app.post("/api/gateway/reconnect")
+async def reconnect_gateway():
+    logging.getLogger(__name__).info("User requested gateway reconnect")
+    await scheduler.restart_gateway()
     return {"ok": True, "gateway": scheduler.snapshot()["gateway"]}
 
 
@@ -180,7 +206,7 @@ async def update_settings(payload: SettingsUpdate):
     values = payload.model_dump(exclude_none=True)
     requires_gateway_restart = any(
         key in values and values[key] != getattr(settings, key)
-        for key in ("gateway_driver", "serial_port")
+        for key in ("gateway_driver", "serial_port", "baudrate", "connect_timeout_seconds")
     )
     try:
         settings.update(values)
@@ -189,6 +215,7 @@ async def update_settings(payload: SettingsUpdate):
         raise HTTPException(400, str(exc)) from exc
     if requires_gateway_restart:
         await scheduler.restart_gateway()
+    logging.getLogger(__name__).info("Settings updated: %s", values)
     return settings.public_dict()
 
 
@@ -208,4 +235,4 @@ async def websocket_endpoint(socket: WebSocket):
 def run() -> None:
     if os.environ.get("WTVB_NO_BROWSER") != "1":
         threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{settings.port}")).start()
-    uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=False)
+    uvicorn.run(app, host=settings.host, port=settings.port, reload=False, log_config=None)

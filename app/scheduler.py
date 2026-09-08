@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from .config import Settings
 from .database import Database
 from .gateway import GatewayEvent, SerialGateway, SimulatorGateway
 from .protocol import SensorSample, WtvbStreamDecoder, evaluate_alarm, normalize_mac
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -83,6 +86,7 @@ class Scheduler:
             self.gateway.start()
         except Exception as exc:
             self.gateway_error = str(exc)
+            logger.exception("Gateway startup failed")
         self._task = asyncio.create_task(self._loop(), name="sensor-scheduler")
 
     async def stop(self) -> None:
@@ -98,6 +102,8 @@ class Scheduler:
     async def restart_gateway(self) -> None:
         """Apply gateway driver/port changes without restarting the web application."""
         self.gateway.stop()
+        self.decoder = WtvbStreamDecoder()
+        self._connect_ready_at = 0.0
         now = time.monotonic()
         for state in self.states.values():
             state.status = "queued"
@@ -116,6 +122,7 @@ class Scheduler:
             self.gateway.start()
         except Exception as exc:
             self.gateway_error = str(exc)
+            logger.exception("Gateway restart failed")
         await self.publish({"type": "snapshot", "snapshot": self.snapshot()})
 
     async def _loop(self) -> None:
@@ -130,6 +137,7 @@ class Scheduler:
                 self._fill_connections()
             except Exception as exc:
                 self.gateway_error = str(exc)
+                logger.exception("Scheduler iteration failed")
             await asyncio.sleep(0.1)
 
     def _sync_devices(self) -> None:
@@ -139,10 +147,19 @@ class Scheduler:
         for mac in eligible:
             self.states.setdefault(mac, DeviceRuntime(mac))
         for mac in list(self.states):
-            if mac not in eligible and self.states[mac].status != "connected":
-                del self.states[mac]
+            if mac not in eligible:
+                state = self.states[mac]
+                if state.status == "connected":
+                    if not getattr(self.gateway, "busy", False):
+                        logger.info("Disconnect disabled device mac=%s", mac)
+                        self.gateway.disconnect(mac)
+                        state.status = "disconnecting"
+                elif state.status not in {"connecting", "disconnecting"}:
+                    del self.states[mac]
 
     async def _handle_event(self, event: GatewayEvent) -> None:
+        if event.kind not in {"scan", "notify"}:
+            logger.info("Gateway event kind=%s mac=%s handle=%s message=%s", event.kind, event.mac, event.handle, event.message)
         if event.kind == "error":
             if event.mac:
                 state = self.states.get(event.mac)
@@ -152,6 +169,8 @@ class Scheduler:
                 state.failures += 1
                 state.error = event.message
                 state.connected_at = None
+                state.handle = None
+                state.last_cycle_at = time.monotonic()
                 # Try each compatibility profile promptly before applying the
                 # longer exponential backoff used for persistently absent units.
                 if state.failures <= 5:
@@ -171,7 +190,6 @@ class Scheduler:
         state = self.states.get(event.mac)
         if not state:
             return
-        self.gateway_error = None
         now = time.monotonic()
         if event.kind == "scan":
             state.last_seen = now
@@ -182,6 +200,8 @@ class Scheduler:
             state.handle = event.handle
             state.failures = 0
             state.error = None
+            state.last_sample_at = None
+            state.latest = None
             self._connect_ready_at = now + 2.0
             self.gateway.scan()
         elif event.kind == "disconnected":
@@ -199,6 +219,8 @@ class Scheduler:
     async def _accept_sample(self, sample: SensorSample) -> None:
         now = time.monotonic()
         state = self.states[sample.mac]
+        if state.last_sample_at is None:
+            logger.info("First valid sensor sample mac=%s temperature=%s", sample.mac, sample.temperature)
         state.last_sample_at = now
         state.latest = sample.as_dict()
         thresholds = self._device_configs.get(sample.mac, {}).get("thresholds", {})
@@ -222,15 +244,19 @@ class Scheduler:
     def _check_timeouts(self) -> None:
         now = time.monotonic()
         for state in self.states.values():
-            if state.status == "connecting" and state.connected_at and now - state.connected_at > self.settings.connect_timeout_seconds + 5:
+            if state.status == "connecting" and state.connected_at and now - state.connected_at > self.settings.connect_timeout_seconds + 20 and not getattr(self.gateway, "busy", False):
                 state.status = "retrying"
                 state.error = "连接超时"
                 state.failures += 1
                 state.retry_at = now + self.settings.reconnect_base_seconds
                 state.connected_at = None
                 self._connect_ready_at = now + 2.0
+                state.last_cycle_at = now
+                logger.error("Scheduler connection timeout mac=%s", state.mac)
 
     def _rotate_completed(self) -> None:
+        if getattr(self.gateway, "busy", False) or any(s.status in {"connecting", "disconnecting"} for s in self.states.values()):
+            return
         now = time.monotonic()
         waiting = [state for state in self.states.values() if state.status in {"queued", "retrying"} and state.retry_at <= now]
         if not waiting:
@@ -244,8 +270,11 @@ class Scheduler:
             ):
                 state.status = "disconnecting"
                 self.gateway.disconnect(state.mac)
+                break
 
     def _fill_connections(self) -> None:
+        if getattr(self.gateway, "busy", False):
+            return
         now = time.monotonic()
         active = self._connected_states()
         if len(active) > self.settings.max_connections:
@@ -262,9 +291,7 @@ class Scheduler:
             return
         if self.focus_mac:
             focus = self.states.get(self.focus_mac)
-            if focus and focus.status not in {"connected", "connecting", "disconnecting"}:
-                if not self._ready_to_connect(focus, now):
-                    return
+            if focus and focus.status not in {"connected", "connecting", "disconnecting"} and focus.retry_at <= now and self._ready_to_connect(focus, now):
                 if len(active) >= self.settings.max_connections:
                     victim = select_victim(list(self.states.values()), self.focus_mac, now, self.settings.dwell_seconds)
                     if victim:
@@ -288,6 +315,7 @@ class Scheduler:
             self._connect(candidates[0], now)
 
     def _connect(self, state: DeviceRuntime, now: float) -> None:
+        logger.info("Schedule connection mac=%s failures=%s rssi=%s", state.mac, state.failures, state.rssi)
         state.status = "connecting"
         state.connected_at = now
         state.error = None
@@ -339,6 +367,8 @@ class Scheduler:
             "is_focus": state.mac == self.focus_mac,
             "connected_seconds": round(now - state.connected_at, 1) if state.connected_at else None,
             "last_seen_seconds_ago": round(now - state.last_seen, 1) if state.last_seen else None,
+            "last_sample_seconds_ago": round(now - state.last_sample_at, 1) if state.last_sample_at else None,
+            "collecting": state.status == "connected" and state.last_sample_at is not None and now - state.last_sample_at <= 10,
             "rssi": state.rssi,
             "failures": state.failures,
             "error": state.error,

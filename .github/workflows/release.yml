@@ -1,0 +1,53 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: python
+        run: |
+          import os
+          from app.diagnostics import VERSION
+          assert os.environ['GITHUB_REF_NAME'] == f'v{VERSION}', 'Tag must match application version'
+      - name: Build and smoke-test executable
+        run: python scripts/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WTVB-Monitor-windows-x64
+          path: |
+            release/*.zip
+            release/*.sha256
+          if-no-files-found: error
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/') || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]'))
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = python -c "from app.diagnostics import VERSION; print(VERSION)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tag = "v$version"
+          $assets = @(Get-ChildItem release/*.zip,release/*.sha256 | ForEach-Object { $_.FullName })
+          gh release create $tag @assets --target "$env:GITHUB_SHA" --title "WTVB Monitor $tag" --notes-file RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

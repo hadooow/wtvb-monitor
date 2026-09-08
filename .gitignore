@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+pytest-of-root/
 .venv/
 venv/
 
@@ -12,6 +13,8 @@ data/*
 *.db-shm
 *.db-wal
 *.log
+logs/
+work/
 
 # Local build outputs
 build/
@@ -24,4 +27,3 @@ release/
 .vscode/
 .DS_Store
 Thumbs.db
-

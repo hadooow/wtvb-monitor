@@ -52,3 +52,72 @@ def test_only_one_connection_attempt_is_started_at_a_time():
 
     assert len(scheduler.gateway.calls) == 1
     assert sum(state.status == "connecting" for state in scheduler.states.values()) == 1
+
+
+def test_busy_gateway_prevents_rotation_and_new_connection(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+    async def publish(_):
+        pass
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), Settings(), publish)
+    calls = []
+    scheduler.gateway = SimpleNamespace(busy=True, disconnect=lambda mac: calls.append(mac), connect=lambda mac: calls.append(mac))
+    scheduler.states = {
+        'F8C5C0B8917E': DeviceRuntime('F8C5C0B8917E', 'connected', connected_at=time.monotonic() - 500),
+        'C2372102DEEF': DeviceRuntime('C2372102DEEF'),
+    }
+    scheduler._rotate_completed()
+    scheduler._fill_connections()
+    assert calls == []
+
+
+def test_failed_device_yields_to_waiting_device(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+    async def publish(_):
+        pass
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), Settings(), publish)
+    scheduler._sync_devices()
+    failed = scheduler.states['F8C5C0B8917E']
+    asyncio.run(scheduler._handle_event(GatewayEvent('error', failed.mac, message='TIMEOUT')))
+    failed.retry_at = 0
+    scheduler._connect_ready_at = 0
+    scheduler._fill_connections()
+    assert failed.status == 'retrying'
+    assert any(s.status == 'connecting' for s in scheduler.states.values())
+
+
+def test_connected_without_sample_is_not_collecting(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+    async def publish(_):
+        pass
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), Settings(), publish)
+    scheduler._sync_devices()
+    mac = 'C2372102DEEF'
+    asyncio.run(scheduler._handle_event(GatewayEvent('connected', mac, handle=0)))
+    assert scheduler.status_dict(mac)['collecting'] is False
+    scheduler.states[mac].last_sample_at = time.monotonic()
+    assert scheduler.status_dict(mac)['collecting'] is True
+    scheduler.states[mac].last_sample_at -= 20
+    assert scheduler.status_dict(mac)['collecting'] is False
+
+
+def test_disabling_connected_sensor_releases_link(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+    async def publish(_):
+        pass
+    database = Database(tmp_path / 'test.db')
+    scheduler = Scheduler(database, Settings(), publish)
+    scheduler._sync_devices()
+    mac = 'C2372102DEEF'
+    scheduler.states[mac].status = 'connected'
+    device = database.get_device_by_mac(mac)
+    database.update_device(device['id'], {'enabled': False})
+    scheduler._sync_devices()
+    assert scheduler.states[mac].status == 'disconnecting'
+    for event in scheduler.gateway.poll():
+        asyncio.run(scheduler._handle_event(event))
+    scheduler._sync_devices()
+    assert mac not in scheduler.states

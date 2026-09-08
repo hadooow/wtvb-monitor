@@ -15,6 +15,7 @@
     <div class="top-actions">
       <div id="gatewayBadge" class="gateway-badge">网关连接中</div>
       <button type="button" class="secondary" id="settingsButton">采集设置</button>
+      <button type="button" class="secondary" id="downloadLogsButton">下载诊断日志</button>
       <button type="button" class="primary" id="addButton">添加设备</button>
     </div>
   </header>
@@ -42,12 +43,15 @@
     <form id="settingsForm">
       <div class="dialog-title"><h2>采集设置</h2><button type="button" data-close="settingsDialog" class="icon-button" aria-label="关闭">×</button></div>
       <label>网关模式<select name="gateway_driver"><option value="simulator">模拟网关（测试用）</option><option value="serial">真实 EW-DTU02 网关</option></select></label>
-      <label>真实网关串口<input name="serial_port" placeholder="COM5"></label>
+      <label>真实网关串口<input name="serial_port" placeholder="COM3"></label>
+      <label>串口波特率<input name="baudrate" type="number" min="1200" max="921600" required></label>
+      <label>连接超时（秒，手册建议 40）<input name="connect_timeout_seconds" type="number" min="5" max="60" required></label>
       <label>同时连接数量<input name="max_connections" type="number" min="1" max="7"></label>
       <label>单次采集时长（分钟）<input name="dwell_minutes" type="number" min="1" max="5"></label>
       <label>数据库保存间隔（秒）<input name="persist_interval_seconds" type="number" min="1" max="60"></label>
       <label>网页刷新次数/秒<input name="web_refresh_hz" type="number" min="1" max="10"></label>
       <p class="hint">切换网关模式会立即重新连接。使用真实网关前，请关闭厂商上位机，避免两个程序同时占用串口。</p>
+      <button type="button" class="secondary" id="reconnectGatewayButton">按已保存设置重新连接网关</button>
       <div class="dialog-actions"><button type="button" data-close="settingsDialog" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </dialog>
