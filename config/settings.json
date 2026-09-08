@@ -1,0 +1,14 @@
+{
+  "gateway_driver": "serial",
+  "serial_port": "COM3",
+  "baudrate": 115200,
+  "max_connections": 5,
+  "dwell_seconds": 180,
+  "connect_timeout_seconds": 20,
+  "reconnect_base_seconds": 10,
+  "focus_lease_seconds": 30,
+  "persist_interval_seconds": 5,
+  "web_refresh_hz": 5,
+  "host": "0.0.0.0",
+  "port": 8000
+}

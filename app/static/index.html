@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>工业无线温振监测系统</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">INDUSTRIAL CONDITION MONITORING</p>
+      <h1>工业无线温振监测系统</h1>
+    </div>
+    <div class="top-actions">
+      <div id="gatewayBadge" class="gateway-badge">网关连接中</div>
+      <button type="button" class="secondary" id="settingsButton">采集设置</button>
+      <button type="button" class="primary" id="addButton">添加设备</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-overview" aria-label="设备采集状态">
+      <div class="overview-heading"><p class="eyebrow">COLLECTION STATUS</p><h2>设备采集状态</h2></div>
+      <div class="status-stat accent"><strong id="connectedCount">0</strong><span id="connectionLimit">/ 5 路连接</span></div>
+      <div class="status-stat"><strong id="deviceCount">0</strong><span>已登记</span></div>
+      <div class="status-stat"><strong id="collectingCount">0</strong><span>正在采集</span></div>
+      <div class="status-stat"><strong id="queuedCount">0</strong><span>排队等待</span></div>
+      <div class="status-stat"><strong id="errorCount">0</strong><span>异常 / 重试</span></div>
+    </section>
+
+    <section class="devices-section">
+      <div class="section-title">
+        <div><p class="eyebrow">SENSOR FLEET</p><h2>设备总览</h2></div>
+        <div class="legend"><span><i class="dot live"></i>采集中</span><span><i class="dot queued"></i>排队中</span><span><i class="dot error"></i>异常</span></div>
+      </div>
+      <div id="deviceGrid" class="device-grid"></div>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form id="settingsForm">
+      <div class="dialog-title"><h2>采集设置</h2><button type="button" data-close="settingsDialog" class="icon-button" aria-label="关闭">×</button></div>
+      <label>网关模式<select name="gateway_driver"><option value="simulator">模拟网关（测试用）</option><option value="serial">真实 EW-DTU02 网关</option></select></label>
+      <label>真实网关串口<input name="serial_port" placeholder="COM5"></label>
+      <label>同时连接数量<input name="max_connections" type="number" min="1" max="7"></label>
+      <label>单次采集时长（分钟）<input name="dwell_minutes" type="number" min="1" max="5"></label>
+      <label>数据库保存间隔（秒）<input name="persist_interval_seconds" type="number" min="1" max="60"></label>
+      <label>网页刷新次数/秒<input name="web_refresh_hz" type="number" min="1" max="10"></label>
+      <p class="hint">切换网关模式会立即重新连接。使用真实网关前，请关闭厂商上位机，避免两个程序同时占用串口。</p>
+      <div class="dialog-actions"><button type="button" data-close="settingsDialog" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="addDialog">
+    <form id="addForm">
+      <div class="dialog-title"><h2>添加传感器</h2><button type="button" data-close="addDialog" class="icon-button" aria-label="关闭">×</button></div>
+      <label>设备名称<input name="name" required placeholder="例如：1号压机"></label>
+      <label>MAC 地址<input name="mac" required placeholder="FE:6D:F4:07:B3:E4"></label>
+      <label>安装位置<input name="location" placeholder="例如：冲压车间 A 区"></label>
+      <div class="dialog-actions"><button type="button" data-close="addDialog" class="secondary">取消</button><button type="submit" class="primary">添加</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="deviceDialog">
+    <form id="deviceForm">
+      <div class="dialog-title"><h2>设备与报警设置</h2><button type="button" data-close="deviceDialog" class="icon-button" aria-label="关闭">×</button></div>
+      <input name="device_id" type="hidden">
+      <label>设备名称<input name="name" required></label>
+      <label>安装位置<input name="location"></label>
+      <div class="threshold-grid">
+        <label>温度预警（°C）<input name="temperature_warn" type="number" step="0.1" placeholder="不启用"></label>
+        <label>温度报警（°C）<input name="temperature_alarm" type="number" step="0.1" placeholder="不启用"></label>
+        <label>速度预警（mm/s）<input name="velocity_warn" type="number" step="0.1" placeholder="不启用"></label>
+        <label>速度报警（mm/s）<input name="velocity_alarm" type="number" step="0.1" placeholder="不启用"></label>
+        <label>位移预警（μm）<input name="displacement_warn" type="number" step="1" placeholder="不启用"></label>
+        <label>位移报警（μm）<input name="displacement_alarm" type="number" step="1" placeholder="不启用"></label>
+        <label>频率预警（Hz）<input name="frequency_warn" type="number" step="1" placeholder="不启用"></label>
+        <label>频率报警（Hz）<input name="frequency_alarm" type="number" step="1" placeholder="不启用"></label>
+      </div>
+      <p class="hint">留空表示不启用该阈值。删除设备会同时删除它的历史采集记录。</p>
+      <div class="dialog-actions split-actions"><button type="button" id="deleteDeviceButton" class="danger">删除设备</button><span></span><button type="button" data-close="deviceDialog" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="deleteDialog" class="confirm-dialog">
+    <div class="confirm-content">
+      <div class="danger-mark">!</div>
+      <div><h2>删除设备</h2><p id="deleteMessage" class="hint"></p></div>
+    </div>
+    <div class="dialog-actions"><button type="button" data-close="deleteDialog" class="secondary">取消</button><button type="button" id="confirmDeleteButton" class="danger">确认删除</button></div>
+  </dialog>
+
+  <dialog id="monitorDialog" class="monitor-dialog">
+    <div class="monitor-shell">
+      <div class="monitor-header">
+        <div><p class="eyebrow">DEVICE LIVE MONITOR</p><h2 id="monitorTitle">设备实时监控</h2><p id="monitorMeta" class="monitor-meta"></p></div>
+        <div class="monitor-actions">
+          <button type="button" id="startFocusButton" class="primary">优先连接并实时监控</button>
+          <button type="button" id="stopFocusButton" class="secondary hidden">结束优先</button>
+          <button type="button" data-close="monitorDialog" class="icon-button" aria-label="关闭">×</button>
+        </div>
+      </div>
+
+      <div id="monitorMessage" class="focus-message"></div>
+      <div id="diagnosticPanel" class="diagnostic-panel hidden"></div>
+
+      <div class="range-toolbar">
+        <div><strong>图表时间范围</strong><span>始终显示当前时间往前的数据，并自动更新</span></div>
+        <label class="range-input"><input id="rangeMinutes" type="number" min="1" max="10080" value="1"><span>分钟</span></label>
+      </div>
+
+      <div class="axis-legend"><span><i class="axis-dot axis-x"></i>X 轴</span><span><i class="axis-dot axis-y"></i>Y 轴</span><span><i class="axis-dot axis-z"></i>Z 轴</span></div>
+      <div class="monitor-charts">
+        <article class="live-chart-card temperature-card">
+          <div class="chart-heading"><div><span>温度</span><strong id="temperatureNow">— °C</strong></div><div class="temperature-legend"><span class="temp-low">较低</span><span class="temp-normal">正常</span><span class="temp-high">较高</span><span class="temp-alarm">报警</span></div></div>
+          <canvas id="chartTemperature"></canvas>
+        </article>
+        <article class="live-chart-card">
+          <div class="chart-heading"><div><span>速度（mm/s）</span><div id="velocityNow" class="axis-values"></div></div></div>
+          <canvas id="chartVelocity"></canvas>
+        </article>
+        <article class="live-chart-card">
+          <div class="chart-heading"><div><span>位移（μm）</span><div id="displacementNow" class="axis-values"></div></div></div>
+          <canvas id="chartDisplacement"></canvas>
+        </article>
+        <article class="live-chart-card">
+          <div class="chart-heading"><div><span>频率（Hz）</span><div id="frequencyNow" class="axis-values"></div></div></div>
+          <canvas id="chartFrequency"></canvas>
+        </article>
+      </div>
+
+      <details class="extra-details">
+        <summary>查看其他传感器参数</summary>
+        <div id="detailValues" class="detail-values"></div>
+      </details>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

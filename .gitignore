@@ -1,0 +1,27 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data and logs
+data/*
+!data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local build outputs
+build/
+dist/
+release/
+*.spec
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
