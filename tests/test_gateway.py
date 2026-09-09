@@ -42,20 +42,21 @@ def test_parse_connection_failure():
     assert unknown.kind == 'error'
 
 
-def test_profiles_start_with_manufacturer_multilink_example():
+def test_profiles_start_with_verified_v04_command():
     gateway = SerialGateway('COM3', 115200)
     gateway._serial = FakeSerial()
     mac = 'F8C5C0B8917E'
     gateway.addresses[mac] = (0, 3)
     commands = []
-    for index in range(5):
+    for index in range(len(gateway.CONNECTION_PROFILES)):
         gateway._profile_cursor[mac] = index
         gateway.connect(mac)
         commands.append(gateway._commands.get_nowait()[0])
-    assert commands[0] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600'
-    assert commands[1] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600'
-    assert commands[2] == f'AT+CONN={mac},,,23,40000,1,40,20,0,600'
-    assert commands[3].endswith(',1,1,0')
+    assert commands[0] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600,1,1,0'
+    assert commands[1] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600'
+    assert commands[2] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600'
+    assert commands[3] == f'AT+CONN={mac},,,23,40000,1,40,20,0,600'
+    assert commands[5].endswith(',1,1,0')
     assert commands[4].endswith(',1,1,0')
 
 
@@ -218,8 +219,19 @@ def test_scan_traffic_does_not_gate_original_sensor_connection():
     gateway._serial = FakeSerial(respond)
     gateway.connect(mac)
     gateway._command_loop()
-    assert gateway._serial.writes == [f'AT+CONN={mac},,,247,40000,1,40,20,0,600', 'AT+SCAN=1']
+    assert gateway._serial.writes == [f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0', 'AT+SCAN=1']
     assert not gateway._faulted
     events = gateway.poll()
     assert any(e.kind == 'connected' and e.mac == mac for e in events)
     assert not any(e.kind == 'error' for e in events)
+
+
+def test_v04_original_sensor_command_uses_scanned_address():
+    gateway = SerialGateway('COM3', 115200)
+    gateway._serial = FakeSerial()
+    gateway._receive_line('+SC_NTF:FE6DF407B3E4,0,1,0,-43,127,38,0,16,020105,0,')
+    gateway.connect('FE:6D:F4:07:B3:E4')
+    assert gateway._commands.get_nowait() == (
+        'AT+CONN=FE6DF407B3E4,0,1,247,40000,1,40,20,0,600,1,1,0',
+        'FE6DF407B3E4',
+    )

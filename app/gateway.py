@@ -107,7 +107,8 @@ class LineBuffer:
 class SerialGateway:
     COMMAND_TIMEOUT_SECONDS = 5.0
     CONNECTION_PROFILES = (
-        # Start with the manufacturer's 10-field, non-pairing command.
+        # Verified by static inspection of the user's working v0.4 EXE.
+        ("v0.4配对连接/扫描地址", 247, 1, True),
         ("普通连接/自动地址", 247, 0, False),
         ("普通连接/扫描地址", 247, 0, True),
         ("普通兼容/MTU23", 23, 0, False),
