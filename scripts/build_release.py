@@ -43,6 +43,10 @@ def smoke_test(bundle: Path) -> None:
                     cbf1 = next(d for d in dashboard['devices'] if d['mac'] == 'C2372102DEEF')
                     if any(d['runtime'].get('collecting') for d in dashboard['devices']):
                         assert cbf1['name'] == 'CBF1-W31'
+                        defaults = {d['mac']: d for d in dashboard['devices']}
+                        assert defaults['FE6DF407B3E4']['name'] == 'WTVB01-BT50'
+                        assert defaults['E8C5C0B8917E']['name'] == 'CBF0-W31'
+                        assert 'F8C5C0B8917E' not in defaults
                         for path in ('/', '/static/app.js', '/api/diagnostics/download'):
                             with urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=5) as response:
                                 data = response.read()

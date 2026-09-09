@@ -140,6 +140,9 @@ class WtvbStreamDecoder:
     def __init__(self) -> None:
         self._buffers: dict[str, bytearray] = {}
 
+    def forget(self, mac: str) -> None:
+        self._buffers.pop(normalize_mac(mac), None)
+
     def feed(self, mac: str, payload: bytes, source: str = "gateway") -> list[SensorSample]:
         mac = normalize_mac(mac)
         buffer = self._buffers.setdefault(mac, bytearray())

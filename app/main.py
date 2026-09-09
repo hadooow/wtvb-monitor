@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import os
 import threading
 import webbrowser
@@ -19,6 +20,7 @@ from .config import Settings, project_root, static_root
 from .database import Database
 from .scheduler import Scheduler
 from .diagnostics import VERSION, configure_logging, diagnostic_archive
+from .protocol import normalize_mac
 
 
 class DeviceCreate(BaseModel):
@@ -30,6 +32,7 @@ class DeviceCreate(BaseModel):
 
 
 class DeviceUpdate(BaseModel):
+    mac: str | None = None
     name: str | None = None
     location: str | None = None
     enabled: bool | None = None
@@ -146,10 +149,29 @@ def add_device(payload: DeviceCreate):
 
 
 @app.patch("/api/devices/{device_id}")
-def update_device(device_id: int, payload: DeviceUpdate):
-    result = database.update_device(device_id, payload.model_dump(exclude_none=True))
-    if not result:
+async def update_device(device_id: int, payload: DeviceUpdate):
+    device = database.get_device(device_id)
+    if not device:
         raise HTTPException(404, "设备不存在")
+    values = payload.model_dump(exclude_none=True)
+    try:
+        if "mac" in values:
+            values["mac"] = normalize_mac(values["mac"])
+    except ValueError as exc:
+        raise HTTPException(400, "MAC 地址格式无效，请输入 12 位十六进制地址") from exc
+    changing_mac = "mac" in values and values["mac"] != device["mac"]
+    state = scheduler.states.get(device["mac"])
+    if changing_mac and state and state.status in {"connected", "connecting", "disconnecting"}:
+        if scheduler.gateway.online and not getattr(scheduler.gateway, "_faulted", False):
+            raise HTTPException(409, "设备正在连接或采集，请先停用设备，等待连接结束后再修改 MAC")
+    try:
+        result = database.update_device(device_id, values)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "该 MAC 地址已被其他设备使用") from exc
+    if changing_mac:
+        await scheduler.remove_device(device["mac"])
+        scheduler._sync_devices()
+        logging.getLogger(__name__).info("Device MAC updated id=%s old=%s new=%s", device_id, device["mac"], values["mac"])
     return result
 
 

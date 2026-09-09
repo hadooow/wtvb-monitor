@@ -78,7 +78,7 @@ def test_failed_device_yields_to_waiting_device(tmp_path):
         pass
     scheduler = Scheduler(Database(tmp_path / 'test.db'), Settings(), publish)
     scheduler._sync_devices()
-    failed = scheduler.states['F8C5C0B8917E']
+    failed = scheduler.states['E8C5C0B8917E']
     asyncio.run(scheduler._handle_event(GatewayEvent('error', failed.mac, message='TIMEOUT')))
     failed.retry_at = 0
     scheduler._connect_ready_at = 0

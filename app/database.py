@@ -72,13 +72,14 @@ class Database:
             if count == 0:
                 now = datetime.now(timezone.utc).isoformat()
                 seed = [
-                    ("F8C5C0B8917E", "CBF0-W31", "7-100", 0),
+                    ("E8C5C0B8917E", "CBF0-W31", "7-100", 0),
                     ("C2372102DEEF", "CBF1-W31", "7-100", 0),
                     ("E358B14B81B5", "CBF2-W31", "7-100", 0),
                     ("E91470052EF9", "CBF3-W31", "7-100", 0),
                     ("D5E44E23860B", "CBF4-W31", "7-100", 0),
                     ("F80D11C2A52E", "CBF5-W31", "7-100", 0),
                     ("F6D0D817D976", "CBF6-W31", "7-100", 0),
+                    ("FE6DF407B3E4", "WTVB01-BT50", "", 0),
                 ]
                 connection.executemany(
                     "INSERT INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
@@ -92,6 +93,20 @@ class Database:
                     "INSERT OR IGNORE INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
                     ("C2372102DEEF", "CBF1-W31", "7-100", 0, datetime.now(timezone.utc).isoformat()),
                 )
+                connection.execute("INSERT INTO migrations(name) VALUES(?)", (migration,))
+
+            migration = "v0.6.2-default-addresses"
+            if not connection.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
+                connection.execute(
+                    "INSERT OR IGNORE INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
+                    ("FE6DF407B3E4", "WTVB01-BT50", "", 0, datetime.now(timezone.utc).isoformat()),
+                )
+                if connection.execute("SELECT 1 FROM devices WHERE mac='E8C5C0B8917E'").fetchone():
+                    # Retain both histories if the user already registered the
+                    # corrected MAC; disable only the confirmed incorrect one.
+                    connection.execute("UPDATE devices SET enabled=0 WHERE mac='F8C5C0B8917E'")
+                else:
+                    connection.execute("UPDATE devices SET mac='E8C5C0B8917E' WHERE mac='F8C5C0B8917E'")
                 connection.execute("INSERT INTO migrations(name) VALUES(?)", (migration,))
 
     def list_devices(self, include_simulated: bool = True) -> list[dict[str, Any]]:
@@ -134,12 +149,14 @@ class Database:
         return self.get_device(int(device_id))
 
     def update_device(self, device_id: int, values: dict[str, Any]) -> dict[str, Any] | None:
-        allowed = {"name", "location", "enabled", "thresholds"}
+        allowed = {"mac", "name", "location", "enabled", "thresholds"}
         assignments: list[str] = []
         parameters: list[Any] = []
         for key, value in values.items():
             if key not in allowed:
                 continue
+            if key == "mac":
+                value = normalize_mac(value)
             if key == "thresholds":
                 value = json.dumps(value or {}, ensure_ascii=False)
             if key == "enabled":

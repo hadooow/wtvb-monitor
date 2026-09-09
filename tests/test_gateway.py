@@ -51,7 +51,6 @@ def test_profiles_start_with_manufacturer_multilink_example():
     for index in range(5):
         gateway._profile_cursor[mac] = index
         gateway.connect(mac)
-        assert gateway._commands.get_nowait() == ('AT+SCAN=0', None)
         commands.append(gateway._commands.get_nowait()[0])
     assert commands[0] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600'
     assert commands[1] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600'
@@ -193,3 +192,34 @@ def test_empty_list_cannot_finish_bluetooth_connection():
     gateway._receive_line('+CNB:0')
     assert gateway._terminal is None
     assert gateway._connection_result is None
+
+
+def test_scan_traffic_does_not_gate_original_sensor_connection():
+    """SCAN=0 stalled in the field; connect must reach the wire directly."""
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = 0.03
+    gateway._running.set()
+    mac = 'FE6DF407B3E4'
+
+    def respond(command):
+        if command.startswith('AT+CONN='):
+            gateway._receive_line(f'+SC_NTF:{mac},0,1,0,-46,127,37,0,16,020105,0,')
+            gateway._receive_line('OK')
+            assert gateway._terminal is None
+            gateway._receive_line(f'+CONN:2,0,{mac},4,247')
+            gateway._receive_line('+CHAR:2,FFE4,0,0,0,0,1,0,0')
+            gateway._receive_line('OK')
+        elif command == 'AT+SCAN=1':
+            gateway._receive_line('OK')
+            gateway._running.clear()
+        else:
+            raise AssertionError(command)
+
+    gateway._serial = FakeSerial(respond)
+    gateway.connect(mac)
+    gateway._command_loop()
+    assert gateway._serial.writes == [f'AT+CONN={mac},,,247,40000,1,40,20,0,600', 'AT+SCAN=1']
+    assert not gateway._faulted
+    events = gateway.poll()
+    assert any(e.kind == 'connected' and e.mac == mac for e in events)
+    assert not any(e.kind == 'error' for e in events)

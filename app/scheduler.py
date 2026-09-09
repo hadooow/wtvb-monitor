@@ -181,7 +181,6 @@ class Scheduler:
                     )
                 state.retry_at = time.monotonic() + retry_delay
                 self._connect_ready_at = time.monotonic() + 2.0
-                self.gateway.scan()
             else:
                 self.gateway_error = event.message
             return
@@ -203,14 +202,12 @@ class Scheduler:
             state.last_sample_at = None
             state.latest = None
             self._connect_ready_at = now + 2.0
-            self.gateway.scan()
         elif event.kind == "disconnected":
             state.status = "queued"
             state.connected_at = None
             state.handle = None
             state.last_cycle_at = now
             self._connect_ready_at = now + 1.0
-            self.gateway.scan()
         elif event.kind == "notify" and event.payload:
             state.last_seen = now
             for sample in self.decoder.feed(event.mac, event.payload, source=self.settings.gateway_driver):
@@ -348,9 +345,10 @@ class Scheduler:
         self._device_configs.pop(mac, None)
         self._last_persist.pop(mac, None)
         self._last_publish.pop(mac, None)
+        self.decoder.forget(mac)
         if self.focus_mac == mac:
             self.clear_focus()
-        if state and state.status in {"connected", "connecting", "disconnecting"}:
+        if state and state.status in {"connected", "connecting", "disconnecting"} and not getattr(self.gateway, "_faulted", False):
             try:
                 self.gateway.disconnect(mac)
             except Exception:

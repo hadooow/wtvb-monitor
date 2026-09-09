@@ -349,6 +349,8 @@ function openDeviceSettings(id) {
   if (!device) return;
   const form = $("#deviceForm");
   form.device_id.value = device.id;
+  form.mac.value = device.mac_display.toUpperCase();
+  form.enabled.value = String(device.enabled);
   form.name.value = device.name;
   form.location.value = device.location || "";
   const names = ["temperature_warn", "temperature_alarm", "velocity_warn", "velocity_alarm", "displacement_warn", "displacement_alarm", "frequency_warn", "frequency_alarm"];
@@ -470,7 +472,12 @@ $("#deviceForm").addEventListener("submit", async event => {
     }
   }
   try {
-    await api(`/api/devices/${form.get("device_id")}`, { method: "PATCH", body: JSON.stringify({ name: form.get("name"), location: form.get("location"), thresholds }) });
+    const original = state.dashboard.devices.find(device => device.id === Number(form.get("device_id")));
+    const updated = await api(`/api/devices/${form.get("device_id")}`, { method: "PATCH", body: JSON.stringify({ mac: form.get("mac"), enabled: form.get("enabled") === "true", name: form.get("name"), location: form.get("location"), thresholds }) });
+    if (original && original.mac !== updated.mac) {
+      state.series.delete(original.mac);
+      if (state.monitorDeviceId === original.id) $("#monitorDialog").close();
+    }
     $("#deviceDialog").close();
     await loadDashboard();
   } catch (error) { alert(error.message); }

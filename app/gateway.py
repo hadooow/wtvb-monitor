@@ -205,7 +205,8 @@ class SerialGateway:
         command = f"AT+CONN={mac},{address_fields},{mtu},{timeout_ms},1,40,20,0,600"
         if security:
             command += ",1,1,0"
-        self.send("AT+SCAN=0")
+        # SCAN=0 can stall during active scanning (observed in field logs).
+        # Send the connection request directly instead of gating it on stop-scan.
         self._commands.put((command, mac))
 
     def disconnect(self, mac: str) -> None:

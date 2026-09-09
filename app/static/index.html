@@ -70,6 +70,9 @@
     <form id="deviceForm">
       <div class="dialog-title"><h2>设备与报警设置</h2><button type="button" data-close="deviceDialog" class="icon-button" aria-label="关闭">×</button></div>
       <input name="device_id" type="hidden">
+      <label>MAC 地址<input name="mac" required maxlength="17" placeholder="FE:6D:F4:07:B3:E4" spellcheck="false"></label>
+      <p class="hint">修改 MAC 会保留历史记录和报警设置。正在连接或采集时，请先停用并等待连接结束后修改。</p>
+      <label>采集状态<select name="enabled"><option value="true">启用</option><option value="false">停用</option></select></label>
       <label>设备名称<input name="name" required></label>
       <label>安装位置<input name="location"></label>
       <div class="threshold-grid">
