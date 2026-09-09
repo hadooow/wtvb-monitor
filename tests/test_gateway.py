@@ -128,3 +128,68 @@ def test_terminator_missing_faults_gateway_instead_of_sending_another_connection
     gateway._execute('AT+CONN=test', 'FE6DF407B3E4')
     assert gateway._faulted and gateway.busy
     assert any('AT_RESPONSE_TIMEOUT' in (e.message or '') for e in gateway.poll())
+
+
+def test_field_empty_connection_list_resumes_startup_scan():
+    """Replay the field firmware's CNB:0 reply without an additional OK."""
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = 0.03
+    gateway._running.set()
+    replies = {
+        'AT+SCAN=0': ['OK'],
+        'AT+OP?': ['+OP:V1.5(2507081320),EW-DTU02-M,000000000000', 'OK'],
+        'AT+CNNI=': ['+CNB:0'],
+        'AT+SCAN=1': ['OK'],
+    }
+
+    def respond(command):
+        for line in replies[command]:
+            gateway._receive_line(line)
+        if command == 'AT+SCAN=1':
+            gateway._running.clear()
+
+    gateway._serial = FakeSerial(respond)
+    for command in replies:
+        gateway.send(command)
+    gateway._command_loop()
+    assert gateway._serial.writes == list(replies)
+    assert not gateway._faulted
+    assert not any(e.kind == 'error' for e in gateway.poll())
+
+
+def test_empty_list_accepts_optional_ok_and_does_not_leak_to_next_command():
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = 0.03
+    gateway._running.set()
+    gateway._serial = FakeSerial(lambda _: [gateway._receive_line(l) for l in ['+CNB:0', 'OK']])
+    gateway._execute('AT+CNNI=', None)
+    assert not gateway._faulted
+    gateway._serial.callback = None
+    gateway._execute('AT+OP?', None)
+    assert gateway._faulted  # Query's OK cannot acknowledge the silent OP query.
+
+
+def test_empty_list_compatibility_does_not_hide_other_failures():
+    cases = [
+        ('AT+CNNI=', []),
+        ('AT+CNNI=', ['+CNB:1']),
+        ('AT+CNNI=', ['+CNB:0', '+CONN:0,FE6DF407B3E4,4,247']),
+        ('AT+CNNI=', ['+CNB:0', 'ERROR']),
+        ('AT+OP?', ['+CNB:0']),
+    ]
+    for command, lines in cases:
+        gateway = SerialGateway('COM3', 115200)
+        gateway.COMMAND_TIMEOUT_SECONDS = 0.03
+        gateway._running.set()
+        gateway._serial = FakeSerial(lambda _: [gateway._receive_line(l) for l in lines])
+        gateway._execute(command, None)
+        assert any(e.kind == 'error' for e in gateway.poll()), (command, lines)
+
+
+def test_empty_list_cannot_finish_bluetooth_connection():
+    gateway = SerialGateway('COM3', 115200)
+    gateway._pending_command = 'AT+CONN=FE6DF407B3E4,,,247,40000,1,40,20,0,600'
+    gateway._pending_mac = 'FE6DF407B3E4'
+    gateway._receive_line('+CNB:0')
+    assert gateway._terminal is None
+    assert gateway._connection_result is None

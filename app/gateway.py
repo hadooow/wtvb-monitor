@@ -105,6 +105,7 @@ class LineBuffer:
 
 
 class SerialGateway:
+    COMMAND_TIMEOUT_SECONDS = 5.0
     CONNECTION_PROFILES = (
         # Start with the manufacturer's 10-field, non-pairing command.
         ("普通连接/自动地址", 247, 0, False),
@@ -129,6 +130,7 @@ class SerialGateway:
         self._pending_mac: str | None = None
         self._connection_result: GatewayEvent | None = None
         self._terminal: str | None = None
+        self._cnni_payload: list[str] = []
         self._unsolicited_reply = False
         self._busy = False
         self._faulted = False
@@ -225,12 +227,13 @@ class SerialGateway:
 
     def _execute(self, command: str, mac: str | None) -> None:
         """Only one AT transaction can own the reply stream."""
-        timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else 5
+        timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
         with self._response:
             self._pending_command = command
             self._pending_mac = mac
             self._connection_result = None
             self._terminal = None
+            self._cnni_payload = []
             self.recent_lines.append(f"TX {command}")
             logger.info("TX %s", command)
             assert self._serial is not None
@@ -244,6 +247,12 @@ class SerialGateway:
             if not self._running.is_set():
                 return
             result, terminal = self._connection_result, self._terminal
+            # Field firmware V1.5(2507081320) returns only +CNB:0 for
+            # an empty connection list. Keep the full response window so an
+            # optional trailing OK is consumed by this query, not the next one.
+            if terminal is None and command == "AT+CNNI=" and self._cnni_payload == ["+CNB:0"]:
+                terminal = "CNB_EMPTY"
+                logger.info("AT+CNNI= completed: +CNB:0 without trailing OK; continuing startup")
             self._pending_command = None
             self._pending_mac = None
         if terminal is None:
@@ -305,6 +314,8 @@ class SerialGateway:
         logger.info("RX %s", line)
         event = parse_gateway_line(line)
         with self._response:
+            if self._pending_command == "AT+CNNI=" and line.startswith(("+CNB:", "+CONN:", "+SERV:", "+CHAR:")):
+                self._cnni_payload.append(line)
             if line.startswith("+"):
                 self._unsolicited_reply = line.startswith(("+SC_NTF:", "+NOTIFY:", "+INDICATE:"))
             if line == "OK" and self._unsolicited_reply:
