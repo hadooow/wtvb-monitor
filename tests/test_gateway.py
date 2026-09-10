@@ -235,3 +235,62 @@ def test_v04_original_sensor_command_uses_scanned_address():
         'AT+CONN=FE6DF407B3E4,0,1,247,40000,1,40,20,0,600,1,1,0',
         'FE6DF407B3E4',
     )
+
+
+def test_field_disconnect_with_role_and_legacy_formats():
+    for line in ['+DISCON:2,0,FE6DF407B3E4,8', '+DISCON:0,FE6DF407B3E4,8']:
+        event = parse_gateway_line(line)
+        assert (event.kind, event.mac, event.handle) == ('disconnected', 'FE6DF407B3E4', 0)
+        assert event.message == 'DISCONNECT (BLE code 8)'
+    assert parse_gateway_line('+DISCON:0,FE6DF407B3E4').kind == 'disconnected'
+    assert parse_gateway_line('+DISCON:2,bad,FE6DF407B3E4,8') is None
+
+
+def test_other_device_disconnect_does_not_finish_pending_connection():
+    gateway = SerialGateway('COM3', 115200)
+    gateway._pending_command = 'AT+CONN=E358B14B81B5'
+    gateway._pending_mac = 'E358B14B81B5'
+    gateway._receive_line('+DISCON:2,0,FE6DF407B3E4,8')
+    gateway._receive_line('OK')
+    assert gateway._terminal is None
+    assert gateway._connection_result is None
+    events = gateway.poll()
+    assert len(events) == 1 and events[0].kind == 'disconnected'
+
+
+def test_nonempty_query_confirmed_by_live_data_resumes_scan():
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = 0.01
+    gateway._running.set()
+    def respond(command):
+        if command == 'AT+CNNI=':
+            for line in ['+CNB:1', '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000', 'OK']:
+                gateway._receive_line(line)
+        else:
+            assert command == 'AT+SCAN=1'
+            gateway._receive_line('OK')
+            gateway._running.clear()
+    gateway._serial = FakeSerial(respond)
+    gateway.send('AT+CNNI=')
+    gateway.send('AT+SCAN=1')
+    gateway._command_loop()
+    assert not gateway._faulted
+    assert gateway._serial.writes == ['AT+CNNI=', 'AT+SCAN=1']
+    assert any(e.kind == 'connected' and e.mac == 'FE6DF407B3E4' for e in gateway.poll())
+
+
+def test_live_query_compatibility_rejects_missing_conflicting_or_disconnected_link():
+    notify = '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000'
+    for lines in [
+        ['+CNB:1'],
+        ['+CNB:2', notify, 'OK'],
+        ['+CNB:1', notify, 'OK', notify.replace('FE6DF407B3E4', 'E358B14B81B5'), 'OK'],
+        ['+CNB:1', notify, 'OK', '+DISCON:2,0,FE6DF407B3E4,8'],
+        ['+CNB:1', notify, 'OK', 'ERROR'],
+    ]:
+        gateway = SerialGateway('COM3', 115200)
+        gateway.COMMAND_TIMEOUT_SECONDS = 0.01
+        gateway._running.set()
+        gateway._serial = FakeSerial(lambda _: [gateway._receive_line(line) for line in lines])
+        gateway._execute('AT+CNNI=', None)
+        assert any(e.kind == 'error' for e in gateway.poll()), lines

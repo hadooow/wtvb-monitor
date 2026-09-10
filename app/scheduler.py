@@ -203,6 +203,9 @@ class Scheduler:
             state.latest = None
             self._connect_ready_at = now + 2.0
         elif event.kind == "disconnected":
+            self.decoder.forget(event.mac)
+            state.last_sample_at = None
+            state.error = event.message
             state.status = "queued"
             state.connected_at = None
             state.handle = None

@@ -60,11 +60,19 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
                 return GatewayEvent("error", message=f"Malformed NOTIFY: {line[:160]}")
     if line.startswith("+DISCON:"):
         parts = line.removeprefix("+DISCON:").split(",")
-        if len(parts) >= 2:
-            try:
-                return GatewayEvent("disconnected", normalize_mac(parts[1]), handle=int(parts[0]))
-            except ValueError:
+        try:
+            # Field firmware: role,handle,mac,reason. Older firmware: handle,mac,reason.
+            if len(parts) == 4:
+                _, handle, mac, reason = parts
+            elif len(parts) in {2, 3}:
+                handle, mac = parts[:2]
+                reason = parts[2] if len(parts) == 3 else ""
+            else:
                 return None
+            return GatewayEvent("disconnected", normalize_mac(mac), handle=int(handle),
+                                message=f"DISCONNECT (BLE code {reason})" if reason else None)
+        except ValueError:
+            return None
     if line.startswith("+CONN:"):
         parts = line.removeprefix("+CONN:").split(",")
         try:
@@ -132,6 +140,7 @@ class SerialGateway:
         self._connection_result: GatewayEvent | None = None
         self._terminal: str | None = None
         self._cnni_payload: list[str] = []
+        self._cnni_live: dict[tuple[str, int], GatewayEvent] = {}
         self._unsolicited_reply = False
         self._busy = False
         self._faulted = False
@@ -236,6 +245,7 @@ class SerialGateway:
             self._connection_result = None
             self._terminal = None
             self._cnni_payload = []
+            self._cnni_live = {}
             self.recent_lines.append(f"TX {command}")
             logger.info("TX %s", command)
             assert self._serial is not None
@@ -255,6 +265,14 @@ class SerialGateway:
             if terminal is None and command == "AT+CNNI=" and self._cnni_payload == ["+CNB:0"]:
                 terminal = "CNB_EMPTY"
                 logger.info("AT+CNNI= completed: +CNB:0 without trailing OK; continuing startup")
+            # Observed nonempty reply: CNB:1 followed only by live notifications.
+            # Accept only if one unique MAC/handle independently proves that link.
+            if (terminal is None and command == "AT+CNNI="
+                    and self._cnni_payload == ["+CNB:1"] and len(self._cnni_live) == 1):
+                terminal = "CNB_LIVE"
+                event = next(iter(self._cnni_live.values()))
+                self.events.put(GatewayEvent("connected", event.mac, handle=event.handle))
+                logger.info("AT+CNNI= completed: +CNB:1 confirmed by live notification mac=%s handle=%s", event.mac, event.handle)
             self._pending_command = None
             self._pending_mac = None
         if terminal is None:
@@ -316,8 +334,11 @@ class SerialGateway:
         logger.info("RX %s", line)
         event = parse_gateway_line(line)
         with self._response:
-            if self._pending_command == "AT+CNNI=" and line.startswith(("+CNB:", "+CONN:", "+SERV:", "+CHAR:")):
+            if self._pending_command == "AT+CNNI=" and line.startswith(("+CNB:", "+CONN:", "+SERV:", "+CHAR:", "+DISCON:")):
                 self._cnni_payload.append(line)
+            if (self._pending_command == "AT+CNNI=" and event and event.kind == "notify"
+                    and event.mac and event.handle is not None and event.payload):
+                self._cnni_live[(event.mac, event.handle)] = event
             if line.startswith("+"):
                 self._unsolicited_reply = line.startswith(("+SC_NTF:", "+NOTIFY:", "+INDICATE:"))
             if line == "OK" and self._unsolicited_reply:

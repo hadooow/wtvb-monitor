@@ -121,3 +121,25 @@ def test_disabling_connected_sensor_releases_link(tmp_path):
         asyncio.run(scheduler._handle_event(event))
     scheduler._sync_devices()
     assert mac not in scheduler.states
+
+
+def test_field_disconnect_clears_phantom_connection(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+    from app.gateway import parse_gateway_line
+    async def publish(_):
+        pass
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), Settings(), publish)
+    scheduler._sync_devices()
+    mac = 'FE6DF407B3E4'
+    runtime = scheduler.states[mac]
+    runtime.status = 'connected'
+    runtime.last_sample_at = time.monotonic()
+    runtime.handle = 0
+    scheduler.decoder.feed(mac, b'\x55\x61')
+    asyncio.run(scheduler._handle_event(parse_gateway_line('+DISCON:2,0,FE6DF407B3E4,8')))
+    assert scheduler.snapshot()['gateway']['connected'] == 0
+    assert runtime.status == 'queued'
+    assert runtime.handle is None and runtime.last_sample_at is None
+    assert mac not in scheduler.decoder._buffers
+    assert '8' in scheduler.status_dict(mac)['error']
