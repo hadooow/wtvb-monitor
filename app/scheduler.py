@@ -30,6 +30,9 @@ class DeviceRuntime:
     rssi: int | None = None
     error: str | None = None
     latest: dict[str, Any] | None = None
+    recovery_reason: str | None = None
+    verified: bool = False
+    data_stable_since: float | None = None
     alarm: dict[str, Any] = field(default_factory=lambda: {"level": "normal", "reasons": []})
 
 
@@ -46,6 +49,9 @@ class Scheduler:
     DISCOVERY_SECONDS = 3.0
     DISCOVERY_LIMIT_SECONDS = 8.0
     REDISCOVERY_SECONDS = 30.0
+    FIRST_SAMPLE_SECONDS = 20.0
+    STALE_SAMPLE_SECONDS = 20.0
+    DATA_SETTLE_SECONDS = 5.0
 
     def __init__(
         self,
@@ -69,6 +75,7 @@ class Scheduler:
         self.gateway = self._make_gateway()
         self.gateway_error: str | None = None
         self._serial_batch: list[str] = []
+        self._serial_candidates: set[str] = set()
         self._serial_draining = False
         self._serial_refresh_at = 0.0
         self._serial_focus_pending = False
@@ -114,6 +121,7 @@ class Scheduler:
         self.decoder = WtvbStreamDecoder()
         self._connect_ready_at = 0.0
         self._serial_batch.clear()
+        self._serial_candidates.clear()
         self._serial_draining = False
         self._serial_refresh_at = 0.0
         self._serial_focus_pending = bool(self.focus_mac)
@@ -129,6 +137,8 @@ class Scheduler:
             state.last_sample_at = None
             state.rssi = None
             state.latest = None
+            state.recovery_reason = None
+            state.data_stable_since = None
             state.alarm = {"level": "normal", "reasons": []}
         self.gateway = self._make_gateway()
         self.gateway_error = None
@@ -145,6 +155,7 @@ class Scheduler:
                 self._sync_devices()
                 for event in self.gateway.poll():
                     await self._handle_event(event)
+                await self._adopt_registered_links()
                 self._expire_focus()
                 self._check_timeouts()
                 self._rotate_completed()
@@ -154,12 +165,25 @@ class Scheduler:
                 logger.exception("Scheduler iteration failed")
             await asyncio.sleep(0.1)
 
+    async def _adopt_registered_links(self) -> None:
+        """A device can be registered after its startup connection event."""
+        if self.settings.gateway_driver != "serial" or self.gateway.busy:
+            return
+        for mac, handle in tuple(self.gateway.active_links.items()):
+            state = self.states.get(mac)
+            if (mac in self._device_configs and state is not None
+                    and state.status in {"queued", "retrying"}):
+                await self._handle_event(GatewayEvent("connected", mac, handle=handle))
+
     def _sync_devices(self) -> None:
         devices = self._eligible_devices()
         self._device_configs = {device["mac"]: device for device in devices}
         eligible = set(self._device_configs)
         for mac in eligible:
-            self.states.setdefault(mac, DeviceRuntime(mac))
+            if mac not in self.states:
+                self.states[mac] = DeviceRuntime(mac)
+                # A newly enabled/registered target gets one prompt discovery.
+                self._serial_refresh_at = 0.0
         for mac in list(self.states):
             if mac not in eligible:
                 state = self.states[mac]
@@ -217,19 +241,28 @@ class Scheduler:
             state.last_discovered = now
             state.rssi = event.rssi
         elif event.kind == "connected":
+            if state.status == "connected" and state.handle == event.handle:
+                return  # A connection-list replay must not reset live samples.
             state.status = "connected"
             state.connected_at = now
             state.handle = event.handle
-            state.failures = 0
             state.error = None
+            state.recovery_reason = None
+            state.data_stable_since = None
             state.last_sample_at = None
             state.latest = None
             self._connect_ready_at = now + 2.0
+            # Long connection procedures must not consume the collection window.
+            self._serial_refresh_at = now + max(self.settings.dwell_seconds, self.REDISCOVERY_SECONDS)
         elif event.kind == "disconnected":
+            silent_link = (state.status == "connected" and state.last_sample_at is None)
+            if silent_link and self.settings.gateway_driver == "serial":
+                self._prepare_no_data_retry(state, now)
             self.decoder.forget(event.mac)
             state.last_sample_at = None
-            state.error = event.message
-            state.status = "queued"
+            state.error = state.recovery_reason or event.message
+            state.status = "retrying" if state.recovery_reason else "queued"
+            state.recovery_reason = None
             state.connected_at = None
             state.handle = None
             state.last_cycle_at = now
@@ -244,7 +277,11 @@ class Scheduler:
         state = self.states[sample.mac]
         if state.last_sample_at is None:
             logger.info("First valid sensor sample mac=%s temperature=%s", sample.mac, sample.temperature)
+        if state.last_sample_at is None or now - state.last_sample_at > 2.0:
+            state.data_stable_since = now
         state.last_sample_at = now
+        state.verified = True
+        state.failures = 0
         state.latest = sample.as_dict()
         thresholds = self._device_configs.get(sample.mac, {}).get("thresholds", {})
         state.alarm = evaluate_alarm(sample, thresholds)
@@ -267,6 +304,15 @@ class Scheduler:
     def _check_timeouts(self) -> None:
         now = time.monotonic()
         for state in self.states.values():
+            if (self.settings.gateway_driver == "serial" and state.status == "connected"
+                    and state.connected_at is not None and not getattr(self.gateway, "busy", False)):
+                last_data = state.last_sample_at if state.last_sample_at is not None else state.connected_at
+                grace = self.STALE_SAMPLE_SECONDS if state.last_sample_at is not None else self.FIRST_SAMPLE_SECONDS
+                if now - last_data >= grace:
+                    self._prepare_no_data_retry(state, now)
+                    state.status = "disconnecting"
+                    self.gateway.disconnect(state.mac)
+                    return
             if state.status == "connecting" and state.connected_at and now - state.connected_at > self.settings.connect_timeout_seconds + 20 and not getattr(self.gateway, "busy", False):
                 state.status = "retrying"
                 state.error = "连接超时"
@@ -276,6 +322,14 @@ class Scheduler:
                 self._connect_ready_at = now + 2.0
                 state.last_cycle_at = now
                 logger.error("Scheduler connection timeout mac=%s", state.mac)
+
+    def _prepare_no_data_retry(self, state: DeviceRuntime, now: float) -> None:
+        state.failures += 1
+        state.recovery_reason = "已连接但未收到有效数据，已隔离该连接并等待重试"
+        state.error = state.recovery_reason
+        state.retry_at = now + min(30 * 2 ** min(state.failures - 1, 3), 240)
+        self.gateway.report_no_data(state.mac)
+        logger.warning("No valid data mac=%s retry_in=%.0fs", state.mac, state.retry_at - now)
 
     def _rotate_completed(self) -> None:
         if self.settings.gateway_driver == "serial":
@@ -380,22 +434,36 @@ class Scheduler:
         focus_switch = (self._serial_focus_pending and focus in waiting
                         and (focus.mac not in self._serial_batch
                              or len(active) >= self.settings.max_connections))
+        if not self._serial_draining and not focus_switch and any(
+            s.last_sample_at is None or now - s.last_sample_at > 10.0
+            or s.data_stable_since is None or now - s.data_stable_since < self.DATA_SETTLE_SECONDS
+            for s in active
+        ):
+            # Confirm data flow before adding another radio/GATT procedure.
+            # _check_timeouts isolates a silent peer instead of stalling forever.
+            return
         if not self._serial_draining and not focus_switch and len(active) < self.settings.max_connections:
             while self._serial_batch:
                 candidate = self.states.get(self._serial_batch.pop(0))
                 if candidate in waiting and candidate.mac in self._device_configs:
                     self._connect(candidate, now)
                     return
+            retries = [s for s in waiting if s.mac in self._serial_candidates]
+            if retries:
+                retries.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, s.failures))
+                self._connect(retries[0], now)
+                return
         # Restarting the app can adopt only one existing link. Rebuild a batch
         # promptly to fill unused slots, then bound retries for an absent peer.
         refill = (waiting and len(active) < self.settings.max_connections
                   and now >= self._serial_refresh_at)
-        expired = (waiting and focus not in active and any(
+        expired = (waiting and focus not in active and active and all(
             s.connected_at is not None and now - s.connected_at >= self.settings.dwell_seconds
             for s in active))
         if active and (focus_switch or refill or expired):
             self._serial_draining = True
             self._serial_batch.clear()
+            self._serial_candidates.clear()
         if self._serial_draining:
             if active:
                 victim = next((s for s in active if s.mac != self.focus_mac), active[0])
@@ -423,8 +491,9 @@ class Scheduler:
             return
         if focus in waiting and focus not in candidates:
             focus.error = "本轮未发现优先设备，请确认供电、距离及手机连接状态；稍后自动重试"
-        candidates.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, s.failures, s.mac))
+        candidates.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, not s.verified, s.failures, s.mac))
         self._serial_batch = [s.mac for s in candidates]
+        self._serial_candidates = set(self._serial_batch)
         self._serial_focus_pending = False
         self._serial_refresh_at = now + self.REDISCOVERY_SECONDS
         gateway.stop_scan()

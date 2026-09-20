@@ -112,6 +112,8 @@ class PhaseGateway:
     def connect(self, mac):
         assert not self.scanning
         self.calls.append(('connect', mac))
+    def report_no_data(self, mac):
+        self.calls.append(("no_data", mac))
     def disconnect(self, mac):
         self.calls.append(('disconnect', mac))
 
@@ -136,6 +138,14 @@ def event(s, kind, mac, handle=0):
     if kind == 'disconnected':
         s.gateway.active_links.pop(mac, None)
     asyncio.run(s._handle_event(GatewayEvent(kind, mac, handle=handle)))
+    if kind == 'connected':
+        sample(s, mac)
+
+
+def sample(s, mac):
+    asyncio.run(s._handle_event(parse_gateway_line(REPLAY['valid'].replace(MACS[0], mac))))
+    # These phase fixtures represent an already established data stream.
+    s.states[mac].data_stable_since = s.gateway.clock[0] - s.DATA_SETTLE_SECONDS
 
 
 def discover(s, clock, macs):
@@ -170,6 +180,9 @@ def test_dwell_drains_whole_batch_then_requires_fresh_discovery(phase_scheduler)
         event(s, 'connected', mac, i)
         s.states[mac].last_discovered = 90
     clock[0] += 65
+    for peer in MACS[:2]:
+        if s.states[peer].status == "connected":
+            sample(s, peer)
     s._fill_connections()
     assert s.gateway.calls[-1] == ('disconnect', MACS[0])
     event(s, 'disconnected', MACS[0])
@@ -212,6 +225,9 @@ def test_active_focus_postpones_scan_until_cleared(phase_scheduler):
     s.settings.max_connections = 1
     s.request_focus(MACS[0])
     clock[0] += 65
+    for peer in MACS[:2]:
+        if s.states[peer].status == "connected":
+            sample(s, peer)
     s._fill_connections()
     assert s.gateway.calls == []
     s.clear_focus()
@@ -255,10 +271,13 @@ def test_repeated_focus_between_connected_devices_keeps_both_streams(phase_sched
     assert not s.gateway.calls
 
 
-def test_restart_with_one_adopted_link_refills_without_waiting_for_dwell(phase_scheduler):
+def test_new_registration_requests_discovery_without_waiting_for_dwell(phase_scheduler):
     s, clock = phase_scheduler
     event(s, 'connected', MACS[0])
     clock[0] += 3
+    s._fill_connections()
+    assert s.gateway.calls == []
+    s._serial_refresh_at = 0  # _sync_devices requests discovery for a new registration.
     s._fill_connections()
     assert s.gateway.calls == [('disconnect', MACS[0])]
     event(s, 'disconnected', MACS[0])
@@ -294,6 +313,7 @@ def test_focus_in_frozen_batch_uses_free_slot_without_disconnecting(phase_schedu
     s._fill_connections()
     event(s, 'connected', MACS[0])
     clock[0] += 40  # Old moving ten-second deadline must not discard peer.
+    sample(s, MACS[0])
     s.request_focus(MACS[1])
     s._fill_connections()
     assert s.gateway.calls[-1] == ('connect', MACS[1])
@@ -314,6 +334,7 @@ def test_failed_candidate_does_not_prevent_other_frozen_candidates(phase_schedul
 def test_query_adopts_two_distinct_live_links_and_never_starts_scan():
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     def respond(command):
         assert command == 'AT+CNNI='
@@ -339,6 +360,7 @@ def test_query_adopts_two_distinct_live_links_and_never_starts_scan():
 def test_two_link_query_rejects_ambiguous_evidence(peers):
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     def respond(_):
         g._receive_line('+CNB:2')
@@ -354,6 +376,7 @@ def test_two_link_query_rejects_ambiguous_evidence(peers):
 def test_lost_disconnect_retries_same_mac_then_consumes_duplicate_ack():
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     command = f'AT+DISCON=,{MACS[0]}'
     def respond(_):
@@ -378,6 +401,7 @@ def test_lost_disconnect_retries_same_mac_then_consumes_duplicate_ack():
 def test_disconnect_retry_exhaustion_faults_without_claiming_success():
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     g._serial = FakeSerial(lambda _: [g._receive_line(line) for line in [REPLAY['valid'], 'OK']])
     g._execute(f'AT+DISCON=,{MACS[0]}', MACS[0])
@@ -389,6 +413,7 @@ def test_disconnect_retry_exhaustion_faults_without_claiming_success():
 def test_disconnect_result_without_terminator_is_not_retried():
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     g._serial = FakeSerial(lambda _: g._receive_line(f'+DISCON:2,0,{MACS[0]},22'))
     g._execute(f'AT+DISCON=,{MACS[0]}', MACS[0])
@@ -398,6 +423,7 @@ def test_disconnect_result_without_terminator_is_not_retried():
 def test_lost_firmware_query_requires_op_payload_on_retry():
     g = SerialGateway('COM5', 115200)
     g.COMMAND_TIMEOUT_SECONDS = .01
+    g.DISCONNECT_TIMEOUT_SECONDS = .04
     g._running.set()
     def respond(_):
         if len(g._serial.writes) == 2:

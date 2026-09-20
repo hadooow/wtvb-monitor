@@ -20,3 +20,19 @@ def test_stream_decoder_reassembles_split_notification():
     samples = decoder.feed("FE6DF407B3E4", EXAMPLE[9:])
     assert len(samples) == 1
     assert samples[0].temperature == 27.9
+
+
+def test_repeated_truncated_frames_never_create_fabricated_samples():
+    decoder = WtvbStreamDecoder()
+    for _ in range(8):
+        assert decoder.feed("02A000000001", EXAMPLE[:20]) == []
+    samples = decoder.feed("02A000000001", EXAMPLE)
+    assert len(samples) == 1
+    assert samples[0].displacement_z == 10.0
+
+
+def test_twenty_byte_fragment_with_real_continuation_still_decodes():
+    decoder = WtvbStreamDecoder()
+    assert decoder.feed("02A000000001", EXAMPLE[:20]) == []
+    samples = decoder.feed("02A000000001", EXAMPLE[20:])
+    assert len(samples) == 1 and samples[0].temperature == 27.9

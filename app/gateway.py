@@ -132,15 +132,14 @@ class LineBuffer:
 class SerialGateway:
     COMMAND_TIMEOUT_SECONDS = 5.0
     IDEMPOTENT_RETRIES = 2
+    DISCONNECT_TIMEOUT_SECONDS = 15.0
     TX_IDLE_SECONDS = 0.02
     CONNECTION_PROFILES = (
         # Verified by static inspection of the user's working v0.4 EXE.
         ("v0.4配对连接/扫描地址", 247, 1, True),
         ("普通连接/自动地址", 247, 0, False),
         ("普通连接/扫描地址", 247, 0, True),
-        ("普通兼容/MTU23", 23, 0, False),
         ("配对连接/自动地址", 247, 1, False),
-        ("配对兼容/MTU23", 23, 1, False),
     )
 
     def __init__(self, port: str, baudrate: int, connect_timeout_seconds: int = 40) -> None:
@@ -160,6 +159,9 @@ class SerialGateway:
         self._terminal: str | None = None
         self._cnni_payload: list[str] = []
         self._cnni_live: dict[tuple[str, int], GatewayEvent] = {}
+        self._cnni_listing: dict[str, GatewayEvent] = {}
+        self._cnni_closed: set[str] = set()
+        self._cnni_current: str | None = None
         self._unsolicited_ok_pending = False
         self._busy = False
         self._faulted = False
@@ -178,6 +180,8 @@ class SerialGateway:
         self._disconnect_retries = 0
         self._command_retries = 0
         self._query_response_seen = False
+        self._scan_query_state: bool | None = None
+        self._disconnect_accepted = False
         self.recent_lines: deque[str] = deque(maxlen=200)
         self.last_response_at: float | None = None
         self.addresses: dict[str, tuple[int, int]] = {}
@@ -292,6 +296,12 @@ class SerialGateway:
         mac = normalize_mac(mac)
         self._commands.put((f"AT+DISCON=,{mac}", mac))
 
+    def report_no_data(self, mac: str) -> None:
+        """A link without samples has not validated its compatibility profile."""
+        index = self._preferred_profile.pop(mac, self._profile_cursor.get(mac, 0))
+        self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
+        self._record("no_data", f"{mac}; next_profile={self._profile_cursor[mac]}")
+
     def scan(self) -> None:
         if not self.busy and not self._connected and not self._scanning:
             self.send("AT+SCAN=1")
@@ -312,6 +322,8 @@ class SerialGateway:
     def _execute(self, command: str, mac: str | None) -> GatewayEvent | None:
         """Only one AT transaction can own the reply stream."""
         timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
+        if command.startswith("AT+DISCON="):
+            timeout = self.DISCONNECT_TIMEOUT_SECONDS
         with self._response:
             if self._reader is not None and not self._wait_tx_gap():
                 return None
@@ -323,7 +335,12 @@ class SerialGateway:
             self._terminal = None
             self._cnni_payload = []
             self._cnni_live = {}
+            self._cnni_listing = {}
+            self._cnni_closed = set()
+            self._cnni_current = None
             self._query_response_seen = False
+            self._scan_query_state = None
+            self._disconnect_accepted = False
             self.recent_lines.append(f"TX {command}")
             logger.info("TX %s", command)
             assert self._serial is not None
@@ -337,9 +354,9 @@ class SerialGateway:
                     # owner. Never retry CONN or arbitrary writes. A parsed
                     # connection/list result missing its terminator still faults.
                     retryable = (
-                        command.startswith("AT+DISCON=") and self._connection_result is None
+                        command.startswith("AT+DISCON=") and self._connection_result is None and not self._disconnect_accepted
                         or command in {"AT+SCAN=0", "AT+SCAN=1"}
-                        or command == "AT+OP?" and not self._query_response_seen
+                        or command in {"AT+OP?", "AT+SCAN?"} and not self._query_response_seen
                         or command == "AT+CNNI=" and not self._cnni_payload
                     )
                     if retryable and retries < self.IDEMPOTENT_RETRIES:
@@ -375,6 +392,21 @@ class SerialGateway:
             if terminal is None and command == "AT+CNNI=" and self._cnni_payload == ["+CNB:0"]:
                 terminal = "CNB_EMPTY"
                 logger.info("AT+CNNI= completed: +CNB:0 without trailing OK; continuing startup")
+            # Each listed link has its own OK. Hold the entire query window,
+            # rather than releasing the next command after the first link.
+            listed = len(self._cnni_listing)
+            counts = [line for line in self._cnni_payload if line.startswith("+CNB:")]
+            if (terminal is None and command == "AT+CNNI=" and 1 <= listed <= 7
+                    and self._cnni_closed == set(self._cnni_listing)
+                    and counts in ([], [f"+CNB:{listed}"])
+                    and len({e.handle for e in self._cnni_listing.values()}) == listed
+                    and not any(line.startswith("+DISCON:") for line in self._cnni_payload)
+                    and sum(line.startswith("+CONN:") for line in self._cnni_payload) == listed):
+                terminal = "CNB_LIST"
+                for event in self._cnni_listing.values():
+                    self._connected[event.mac] = event.handle
+                    self.events.put(event)
+                logger.info("AT+CNNI= completed: %s complete connection records", listed)
             # Some field firmware sends only CNB:N plus live notifications.
             # Require exactly N distinct MACs AND handles, with no conflicting
             # list/disconnect records; keep the full window to absorb trailing OKs.
@@ -406,6 +438,8 @@ class SerialGateway:
                 self._scanning = False
             elif command == "AT+SCAN=1":
                 self._scanning = True
+            elif command == "AT+SCAN?":
+                self._scanning = self._scan_query_state
         if mac:
             if terminal == "ERROR" and (result is None or result.kind != "error"):
                 result = GatewayEvent("error", mac, message=f"AT_ERROR: {command}")
@@ -418,7 +452,7 @@ class SerialGateway:
             message = f"AT_ERROR: {command}"
             logger.error("Command rejected: %s", command)
             self.events.put(GatewayEvent("error", message=message))
-            if command in {"AT+SCAN=0", "AT+SCAN=1"}:
+            if command in {"AT+SCAN=0", "AT+SCAN=1", "AT+SCAN?"}:
                 self._set_fault(message)
         return None
 
@@ -441,6 +475,22 @@ class SerialGateway:
             self._response.wait(.005)
         return False
 
+    def _confirm_scan_stopped(self) -> None:
+        # Corrupted scan reports can leave an orphan OK on the RS485 bus.
+        # Verify the typed state reply before any connection command follows.
+        for _ in range(self.IDEMPOTENT_RETRIES + 1):
+            self._execute("AT+SCAN=0", None)
+            if self._faulted or not self._running.is_set():
+                return
+            self._execute("AT+SCAN?", None)
+            if self._faulted or not self._running.is_set():
+                return
+            if self._scanning is False:
+                return
+        message = "SCAN_STOP_UNCONFIRMED: 网关仍在扫描，请检查串口链路并重新连接网关"
+        self._set_fault(message)
+        self.events.put(GatewayEvent("error", message=message))
+
     def _command_loop(self) -> None:
         while self._running.is_set() and not self._faulted:
             try:
@@ -457,7 +507,7 @@ class SerialGateway:
                     continue
                 if mac and command.startswith("AT+CONN="):
                     if self._scanning is not False:
-                        self._execute("AT+SCAN=0", None)
+                        self._confirm_scan_stopped()
                     if self._faulted:
                         message = self._first_blocking_error or "AT+SCAN=0 failed"
                         self._finish_connection(
@@ -467,6 +517,8 @@ class SerialGateway:
                     if not self._running.is_set():
                         continue
                     self._execute(command, mac)
+                elif command == "AT+SCAN=0":
+                    self._confirm_scan_stopped()
                 else:
                     self._execute(command, mac)
             except Exception as exc:
@@ -511,6 +563,11 @@ class SerialGateway:
         with self._response:
             if self._pending_command == "AT+OP?" and line.startswith("+OP:"):
                 self._query_response_seen = True
+            if self._pending_command == "AT+SCAN?" and line.startswith("+SCAN:"):
+                fields = line.removeprefix("+SCAN:").split(",")
+                if len(fields) == 6 and fields[0] in {"0", "1"} and all(p.isdigit() for p in fields):
+                    self._scan_query_state = fields[0] == "1"
+                    self._query_response_seen = True
             if self._pending_command == "AT+CNNI=" and line.startswith(("+CNB:", "+CONN:", "+SERV:", "+CHAR:", "+DISCON:")):
                 self._cnni_payload.append(line)
             if (self._pending_command == "AT+CNNI=" and event and event.kind == "notify"
@@ -526,12 +583,29 @@ class SerialGateway:
             if line == "OK" and self._unsolicited_ok_pending:
                 self._unsolicited_ok_pending = False
                 return
+            if self._pending_command == "AT+CNNI=":
+                if event and event.kind == "connected":
+                    self._cnni_listing[event.mac] = event
+                    self._cnni_current = event.mac
+                    return
+                if line == "OK":
+                    if self._cnni_current is not None:
+                        self._cnni_closed.add(self._cnni_current)
+                        self._cnni_current = None
+                    return
             expected = "disconnected" if (self._pending_command or "").startswith("AT+DISCON=") else "connected"
             if event and event.mac == self._pending_mac and self._pending_mac and event.kind in {expected, "error"}:
                 self._connection_result = event
                 return
             if line in {"OK", "ERROR"} and self._pending_command:
-                if line == "OK" and self._pending_command == "AT+OP?" and not self._query_response_seen:
+                if self._pending_command.startswith("AT+DISCON=") and self._connection_result is None:
+                    # Field firmware acknowledges immediately but reports the
+                    # actual disconnect after its BLE timeout (~6s). A duplicate
+                    # DISCON can return ERROR while that operation still runs.
+                    # Keep ownership and wait for matching DISCON + its OK.
+                    self._disconnect_accepted = True
+                    return
+                if line == "OK" and self._pending_command in {"AT+OP?", "AT+SCAN?"} and not self._query_response_seen:
                     return
                 # Unsolicited scan/notify OKs cannot complete a connection
                 # before the matching +CONN result has arrived.

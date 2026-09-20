@@ -72,9 +72,8 @@ def test_profiles_start_with_verified_v04_command():
     assert commands[0] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600,1,1,0'
     assert commands[1] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600'
     assert commands[2] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600'
-    assert commands[3] == f'AT+CONN={mac},,,23,40000,1,40,20,0,600'
-    assert commands[5].endswith(',1,1,0')
-    assert commands[4].endswith(',1,1,0')
+    assert commands[3] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0'
+    assert all(',247,40000,' in command for command in commands)
 
 
 def test_fragmented_serial_reads_preserve_multiple_messages():
@@ -154,6 +153,7 @@ def test_field_empty_connection_list_resumes_startup_scan():
     gateway._running.set()
     replies = {
         'AT+SCAN=0': ['OK'],
+        'AT+SCAN?': ['+SCAN:0,160,80,0,1,0', 'OK'],
         'AT+OP?': ['+OP:V1.5(2507081320),EW-DTU02-M,000000000000', 'OK'],
         'AT+CNNI=': ['+CNB:0'],
         'AT+SCAN=1': ['OK'],
@@ -167,7 +167,8 @@ def test_field_empty_connection_list_resumes_startup_scan():
 
     gateway._serial = FakeSerial(respond)
     for command in replies:
-        gateway.send(command)
+        if command != 'AT+SCAN?':
+            gateway.send(command)
     gateway._command_loop()
     assert gateway._serial.writes == list(replies)
     assert not gateway._faulted
@@ -222,6 +223,9 @@ def test_connection_stops_scan_before_connect_and_keeps_it_off_while_collecting(
     def respond(command):
         if command == 'AT+SCAN=0':
             gateway._receive_line('OK')
+        elif command == 'AT+SCAN?':
+            gateway._receive_line('+SCAN:0,160,80,0,1,0')
+            gateway._receive_line('OK')
         elif command.startswith('AT+CONN='):
             gateway._receive_line(f'+CONN:2,0,{mac},4,247')
             gateway._receive_line('+CHAR:2,FFE4,0,0,0,0,1,0,0')
@@ -235,6 +239,7 @@ def test_connection_stops_scan_before_connect_and_keeps_it_off_while_collecting(
     gateway._command_loop()
     assert gateway._serial.writes == [
         'AT+SCAN=0',
+        'AT+SCAN?',
         f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0',
     ]
     assert not gateway._faulted
@@ -252,6 +257,9 @@ def test_failed_connection_leaves_scan_decision_to_scheduler():
     def respond(command):
         if command == 'AT+SCAN=0':
             gateway._receive_line('OK')
+        elif command == 'AT+SCAN?':
+            gateway._receive_line('+SCAN:0,160,80,0,1,0')
+            gateway._receive_line('OK')
         else:
             assert command.startswith('AT+CONN=')
             gateway._receive_line(f'+CONN:2,65535,{mac},0,TIMEOUT')
@@ -259,7 +267,7 @@ def test_failed_connection_leaves_scan_decision_to_scheduler():
     gateway._serial = FakeSerial(respond)
     gateway.connect(mac)
     run_commands(gateway)
-    assert len(gateway._serial.writes) == 2
+    assert len(gateway._serial.writes) == 3
     assert not gateway.scanning
     assert any(e.kind == 'error' and e.mac == mac for e in gateway.poll())
 

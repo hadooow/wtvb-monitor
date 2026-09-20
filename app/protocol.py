@@ -146,6 +146,11 @@ class WtvbStreamDecoder:
     def feed(self, mac: str, payload: bytes, source: str = "gateway") -> list[SensorSample]:
         mac = normalize_mac(mac)
         buffer = self._buffers.setdefault(mac, bytearray())
+        if (buffer[:2] == b"\x55\x61" and len(buffer) == 20
+                and payload.startswith(b"\x55\x61")):
+            # MTU23 peers can repeatedly send only the first 20 bytes of each
+            # 32-byte sample. A new frame is not the missing continuation.
+            buffer.clear()
         buffer.extend(payload)
         samples: list[SensorSample] = []
         while True:
