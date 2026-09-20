@@ -2,7 +2,13 @@
 
 面向 WTVB01-BT50 温振传感器和 EW-DTU02 蓝牙转串口网关，目标运行环境为 Windows 11 x64。
 
-## v0.6.4
+## v0.6.5
+
+根据 2026-09-20 现场复测，串口模式现在把扫描发现与持续采集拆成两个阶段：扫描到目标后先确认关闭扫描，再连接并持续采集；采集期间保持停扫。连接失败或轮换断开后再恢复扫描。这样避免已复现的“扫描报告与高频通知并行回传时出现损坏报文”的场景。
+
+同时增加通知声明长度拒收、坏通知/非 ASCII 字节计数、扫描状态与首个阻断错误诊断。保留 v0.4 已验证连接参数、40 秒连接超时、5 秒写库频率及旧配置兼容。该调整基于短窗口复测，不等同于已经确定网关、RS485、转换器或 USB 驱动的最终硬件责任层。
+
+### v0.6.5
 
 修复现场四字段断开通知未识别、断开后仍计入连接数的问题；查询仅返回 `+CNB:1` 时，只有同一查询窗口内收到唯一 MAC/handle 的有效通知载荷，才据此确认现有连接并继续启动。缺失或矛盾证据仍报告超时。
 
@@ -30,8 +36,8 @@
 ## 下载运行
 
 1. 打开 https://github.com/hadooow/wtvb-monitor/releases 。
-2. 在 v0.6.4 的 Assets 中下载 `WTVB-Monitor-v0.6.4-windows-x64.zip`。GitHub 自动提供的 `Source code` 是源码，不能直接当作 EXE 运行。
-3. 右键 ZIP → 全部解压，建议解压到有写入权限的目录，例如 `D:\WTVB-v0.6.4`。
+2. 在 v0.6.4 的 Assets 中下载 `WTVB-Monitor-v0.6.5-windows-x64.zip`。GitHub 自动提供的 `Source code` 是源码，不能直接当作 EXE 运行。
+3. 右键 ZIP → 全部解压，建议解压到有写入权限的目录，例如 `D:\WTVB-v0.6.5`。
 4. 打开解压后的 `WTVB-Monitor` 文件夹，双击 `WTVB-Monitor.exe`。保留整个文件夹及 `_internal` 子目录，无需安装 Python。
 5. 程序自动打开 `http://127.0.0.1:8000`；未自动打开时可手动输入。保留程序窗口，关闭窗口会停止采集。
 6. 点击“采集设置”，选择真实 EW-DTU02 网关。按设备管理器中实际端口设置 COM 号，默认 COM3；波特率默认 115200，需与网关一致；连接超时建议 40 秒。
@@ -46,7 +52,7 @@
 
 日志自动开启，无需额外操作。
 
-- **最方便：** 首页点击“下载诊断日志”，浏览器下载 `WTVB-diagnostics-v0.6.4.zip`。其中含 `diagnostics.json`（版本、配置及状态快照）和 `logs/monitor.log*`。
+- **最方便：** 首页点击“下载诊断日志”，浏览器下载 `WTVB-diagnostics-v0.6.5.zip`。其中含 `diagnostics.json`（版本、配置及状态快照）和 `logs/monitor.log*`。
 - **本地查看：** 打开 EXE 同目录的 `logs\monitor.log`，用记事本或 VS Code 查看。源码运行时位于项目根目录的 `logs`。
 - **实时查看：** 在程序目录打开 PowerShell，执行：
 
@@ -85,7 +91,7 @@ py -3.12 -m venv .venv
 .\build_release.bat
 ```
 
-脚本先运行测试，再用 PyInstaller 打包，复制静态资源及现场配置，在临时副本中自动运行 EXE 验证模拟采集、首页及日志下载。成功后生成 `release\WTVB-Monitor-v0.6.4-windows-x64.zip` 和 SHA256 文件。临时自检数据不会装进发布包。
+脚本先运行测试，再用 PyInstaller 打包，复制静态资源及现场配置，在临时副本中自动运行 EXE 验证模拟采集、首页及日志下载。成功后生成 `release\WTVB-Monitor-v0.6.5-windows-x64.zip` 和 SHA256 文件。临时自检数据不会装进发布包。
 
 ## GitHub 自动发布（维护者）
 
@@ -94,9 +100,9 @@ py -3.12 -m venv .venv
 正式发布时，确保版本号与标签相同，然后：
 
 ```powershell
-git tag v0.6.4
+git tag v0.6.5
 git push origin main
-git push origin v0.6.4
+git push origin v0.6.5
 ```
 
 标签触发 Windows 构建，通过测试与 EXE 自检后自动创建 Release 并上传 ZIP 和校验文件。推送工作流需要仓库相应写入权限。仅上传源码不会自动产生可执行文件。
