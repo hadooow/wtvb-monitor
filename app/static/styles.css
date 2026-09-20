@@ -52,6 +52,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .danger { background: rgba(255,111,105,.12); color: var(--red); border: 1px solid rgba(255,111,105,.36); }
 .gateway-badge { padding: 9px 13px; border-radius: 999px; background: rgba(49,223,196,.1); color: var(--cyan); border: 1px solid rgba(49,223,196,.28); font-size: 13px; }
 .gateway-badge.error { color: var(--red); background: rgba(255,111,105,.1); border-color: rgba(255,111,105,.3); }
+.gateway-warning { color: var(--text); border-left: 3px solid var(--red); padding: 8px 12px; }
 
 .status-overview {
   display: grid;

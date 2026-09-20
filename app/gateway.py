@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from queue import Empty, Queue
 from typing import Literal
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class GatewayEvent:
-    kind: Literal["scan", "connected", "disconnected", "notify", "error", "info"]
+    kind: Literal["scan", "connected", "disconnected", "notify", "error", "warning", "info"]
     mac: str | None = None
     payload: bytes | None = None
     handle: int | None = None
@@ -46,19 +47,25 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
                 return None
     if line.startswith("+NOTIFY:"):
         parts = line.removeprefix("+NOTIFY:").split(",", 6)
+        mac = None
+        try:
+            mac = normalize_mac(parts[1])
+        except (ValueError, IndexError):
+            pass
         if len(parts) == 7:
             try:
+                # This line parser consumes ASCII/hex text, never raw HEX mode.
+                if int(parts[4]) != 0 or int(parts[5]) < 0:
+                    raise ValueError("unsupported NOTIFY type or length")
+                if not 0 <= int(parts[0]) < 65535 or not 0 <= int(parts[2]) <= 65535:
+                    raise ValueError("invalid NOTIFY handle")
+                if len(parts[3]) not in {4, 32}:
+                    raise ValueError("invalid characteristic UUID")
+                bytes.fromhex(parts[3])
                 payload_text = "".join(parts[6].split())
                 payload = bytes.fromhex(payload_text) if payload_text else b""
-                declared_length = int(parts[5])
-                if len(payload) != declared_length:
-                    return GatewayEvent(
-                        "error",
-                        message=(
-                            f"Malformed NOTIFY length declared={declared_length} "
-                            f"actual={len(payload)}: {line[:160]}"
-                        ),
-                    )
+                if len(payload) != int(parts[5]):
+                    raise ValueError("NOTIFY length mismatch")
                 return GatewayEvent(
                     "notify",
                     normalize_mac(parts[1]),
@@ -66,7 +73,8 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
                     handle=int(parts[0]),
                 )
             except (ValueError, IndexError):
-                return GatewayEvent("error", message=f"Malformed NOTIFY: {line[:160]}")
+                pass
+        return GatewayEvent("warning", mac, message=f"Malformed NOTIFY: {line[:160]}")
     if line.startswith("+DISCON:"):
         parts = line.removeprefix("+DISCON:").split(",")
         try:
@@ -123,6 +131,8 @@ class LineBuffer:
 
 class SerialGateway:
     COMMAND_TIMEOUT_SECONDS = 5.0
+    IDEMPOTENT_RETRIES = 2
+    TX_IDLE_SECONDS = 0.02
     CONNECTION_PROFILES = (
         # Verified by static inspection of the user's working v0.4 EXE.
         ("v0.4配对连接/扫描地址", 247, 1, True),
@@ -154,10 +164,20 @@ class SerialGateway:
         self._busy = False
         self._faulted = False
         self._first_blocking_error: str | None = None
-        self._scanning = False
+        self._scanning: bool | None = None
+        self.scan_started_at: float | None = None
+        self.first_fault: dict | None = None
+        self.warning_count = 0
+        self.last_warning: dict | None = None
+        self.history: deque[dict] = deque(maxlen=50)
         self._connected: dict[str, int] = {}
         self._bad_notify_count = 0
         self._non_ascii_bytes = 0
+        self._last_rx_at = 0.0
+        self._rx_partial = False
+        self._disconnect_retries = 0
+        self._command_retries = 0
+        self._query_response_seen = False
         self.recent_lines: deque[str] = deque(maxlen=200)
         self.last_response_at: float | None = None
         self.addresses: dict[str, tuple[int, int]] = {}
@@ -178,8 +198,12 @@ class SerialGateway:
         return self._busy or self._faulted or not self._commands.empty()
 
     @property
-    def scanning(self) -> bool:
+    def scanning(self) -> bool | None:
         return self._scanning
+
+    @property
+    def active_links(self) -> dict[str, int]:
+        return self._connected
 
     def diagnostics(self) -> dict:
         return {
@@ -189,17 +213,32 @@ class SerialGateway:
             "scanning": self._scanning,
             "active_connections": len(self._connected),
             "first_blocking_error": self._first_blocking_error,
+            "first_fault": self.first_fault,
+            "warning_count": self.warning_count,
+            "last_warning": self.last_warning,
+            "event_history": list(self.history),
             "bad_notify_count": self._bad_notify_count,
             "non_ascii_bytes": self._non_ascii_bytes,
+            "disconnect_retries": self._disconnect_retries,
+            "command_retries": self._command_retries,
             "pending_command": self._pending_command,
             "last_response_seconds_ago": round(time.monotonic() - self.last_response_at, 1) if self.last_response_at else None,
             "recent_lines": list(self.recent_lines)[-30:],
         }
 
+    def _record(self, kind: str, message: str) -> dict:
+        entry = {"time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                 "kind": kind, "message": message}
+        self.history.append(entry)
+        return entry
+
     def _set_fault(self, message: str) -> None:
         self._faulted = True
         if self._first_blocking_error is None:
             self._first_blocking_error = message
+        entry = self._record("fault", message)
+        if self.first_fault is None:
+            self.first_fault = entry
 
     def start(self) -> None:
         if self._serial and self._serial.is_open:
@@ -209,7 +248,7 @@ class SerialGateway:
         self._reader = threading.Thread(target=self._read_loop, name="gateway-reader", daemon=True)
         self._reader.start()
         logger.info("Serial opened port=%s baudrate=%s connect_timeout=%ss", self.port_name, self.baudrate, self.connect_timeout_seconds)
-        for command in ("AT+SCAN=0", "AT+OP?", "AT+CNNI=", "AT+SCAN=1"):
+        for command in ("AT+SCAN=0", "AT+OP?", "AT+CNNI="):
             self.send(command)
         self._worker = threading.Thread(target=self._command_loop, name="gateway-commands", daemon=True)
         self._worker.start()
@@ -257,6 +296,10 @@ class SerialGateway:
         if not self.busy and not self._connected and not self._scanning:
             self.send("AT+SCAN=1")
 
+    def stop_scan(self) -> None:
+        if not self.busy and self._scanning is not False:
+            self.send("AT+SCAN=0")
+
     def poll(self, limit: int = 500) -> list[GatewayEvent]:
         result: list[GatewayEvent] = []
         for _ in range(limit):
@@ -270,22 +313,59 @@ class SerialGateway:
         """Only one AT transaction can own the reply stream."""
         timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
         with self._response:
+            if self._reader is not None and not self._wait_tx_gap():
+                return None
+            if command == "AT+SCAN=1":
+                self.scan_started_at = time.monotonic()
             self._pending_command = command
             self._pending_mac = mac
             self._connection_result = None
             self._terminal = None
             self._cnni_payload = []
             self._cnni_live = {}
+            self._query_response_seen = False
             self.recent_lines.append(f"TX {command}")
             logger.info("TX %s", command)
             assert self._serial is not None
             self._serial.write((command + "\r\n").encode("ascii"))
             deadline = time.monotonic() + timeout
+            retries = 0
             while self._running.is_set() and self._terminal is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    # Retry only idempotent operations under the SAME reply
+                    # owner. Never retry CONN or arbitrary writes. A parsed
+                    # connection/list result missing its terminator still faults.
+                    retryable = (
+                        command.startswith("AT+DISCON=") and self._connection_result is None
+                        or command in {"AT+SCAN=0", "AT+SCAN=1"}
+                        or command == "AT+OP?" and not self._query_response_seen
+                        or command == "AT+CNNI=" and not self._cnni_payload
+                    )
+                    if retryable and retries < self.IDEMPOTENT_RETRIES:
+                        if self._reader is not None and not self._wait_tx_gap():
+                            break
+                        if self._terminal is not None or self._connection_result is not None:
+                            deadline = time.monotonic() + timeout
+                            continue
+                        retries += 1
+                        self._command_retries += 1
+                        if command.startswith("AT+DISCON="):
+                            self._disconnect_retries += 1
+                        logger.warning("Retry same idempotent transaction attempt=%s command=%s", retries, command)
+                        self._record("retry", f"{command}; attempt={retries}")
+                        self.recent_lines.append(f"TX {command}")
+                        self._serial.write((command + "\r\n").encode("ascii"))
+                        deadline = time.monotonic() + timeout
+                        continue
                     break
                 self._response.wait(min(remaining, 0.2))
+            if retries and self._terminal == "OK":
+                # Retain reply ownership briefly for a duplicate command's
+                # trailing ACK/ERROR; it must not terminate the next command.
+                settle_until = time.monotonic() + .5
+                while self._running.is_set() and time.monotonic() < settle_until:
+                    self._response.wait(.05)
             if not self._running.is_set() and self._terminal is None:
                 return None
             result, terminal = self._connection_result, self._terminal
@@ -295,15 +375,19 @@ class SerialGateway:
             if terminal is None and command == "AT+CNNI=" and self._cnni_payload == ["+CNB:0"]:
                 terminal = "CNB_EMPTY"
                 logger.info("AT+CNNI= completed: +CNB:0 without trailing OK; continuing startup")
-            # Observed nonempty reply: CNB:1 followed only by live notifications.
-            # Accept only if one unique MAC/handle independently proves that link.
-            if (terminal is None and command == "AT+CNNI="
-                    and self._cnni_payload == ["+CNB:1"] and len(self._cnni_live) == 1):
+            # Some field firmware sends only CNB:N plus live notifications.
+            # Require exactly N distinct MACs AND handles, with no conflicting
+            # list/disconnect records; keep the full window to absorb trailing OKs.
+            count = len(self._cnni_live)
+            if (terminal is None and command == "AT+CNNI=" and 1 <= count <= 7
+                    and self._cnni_payload == [f"+CNB:{count}"]
+                    and len({mac for mac, _ in self._cnni_live}) == count
+                    and len({handle for _, handle in self._cnni_live}) == count):
                 terminal = "CNB_LIVE"
-                event = next(iter(self._cnni_live.values()))
-                self._connected[event.mac] = event.handle if event.handle is not None else 0
-                self.events.put(GatewayEvent("connected", event.mac, handle=event.handle))
-                logger.info("AT+CNNI= completed: +CNB:1 confirmed by live notification mac=%s handle=%s", event.mac, event.handle)
+                for event in self._cnni_live.values():
+                    self._connected[event.mac] = event.handle
+                    self.events.put(GatewayEvent("connected", event.mac, handle=event.handle))
+                logger.info("AT+CNNI= completed: %s links confirmed by live notifications", count)
             self._pending_command = None
             self._pending_mac = None
         if terminal is None:
@@ -316,6 +400,8 @@ class SerialGateway:
             self.events.put(GatewayEvent("error", message=message))
             return result
         if terminal != "ERROR":
+            if command == "AT+CNNI=" and self._cnni_payload == ["+CNB:0"]:
+                self._connected.clear()
             if command == "AT+SCAN=0":
                 self._scanning = False
             elif command == "AT+SCAN=1":
@@ -323,14 +409,37 @@ class SerialGateway:
         if mac:
             if terminal == "ERROR" and (result is None or result.kind != "error"):
                 result = GatewayEvent("error", mac, message=f"AT_ERROR: {command}")
+            if command.startswith("AT+DISCON=") and (result is None or result.kind != "disconnected"):
+                message = f"DISCONNECT_UNCONFIRMED: {command}; 请重新连接网关"
+                self._set_fault(message)
+                self.events.put(GatewayEvent("error", message=message))
             return self._finish_connection(result or GatewayEvent("error", mac, message="Missing connection result"))
         if terminal == "ERROR":
             message = f"AT_ERROR: {command}"
             logger.error("Command rejected: %s", command)
             self.events.put(GatewayEvent("error", message=message))
-            if command == "AT+SCAN=0":
+            if command in {"AT+SCAN=0", "AT+SCAN=1"}:
                 self._set_fault(message)
         return None
+
+    def _wait_tx_gap(self) -> bool:
+        """Prefer an idle, complete-line gap on the half-duplex RS485 bus.
+
+        USB buffering prevents a collision guarantee; bounded MAC-disconnect
+        retries handle a lost command without retrying arbitrary AT operations.
+        Called with the response lock, which wait releases for the reader.
+        """
+        deadline = time.monotonic() + 2.0
+        while self._running.is_set():
+            now = time.monotonic()
+            if (not self._rx_partial and now - self._last_rx_at >= self.TX_IDLE_SECONDS
+                    and self._serial is not None and self._serial.in_waiting == 0):
+                return True
+            if now >= deadline:
+                logger.warning("No idle serial gap within 2s; sending pending command")
+                return True
+            self._response.wait(.005)
+        return False
 
     def _command_loop(self) -> None:
         while self._running.is_set() and not self._faulted:
@@ -347,7 +456,7 @@ class SerialGateway:
                     )
                     continue
                 if mac and command.startswith("AT+CONN="):
-                    if self._scanning:
+                    if self._scanning is not False:
                         self._execute("AT+SCAN=0", None)
                     if self._faulted:
                         message = self._first_blocking_error or "AT+SCAN=0 failed"
@@ -355,19 +464,9 @@ class SerialGateway:
                             GatewayEvent("error", mac, message=f"SCAN_STOP_FAILED: {message}")
                         )
                         continue
-                    result = self._execute(command, mac)
-                    if (
-                        result
-                        and result.kind == "error"
-                        and not self._faulted
-                        and self._running.is_set()
-                        and not self._connected
-                    ):
-                        self._execute("AT+SCAN=1", None)
-                elif mac and command.startswith("AT+DISCON="):
+                    if not self._running.is_set():
+                        continue
                     self._execute(command, mac)
-                    if not self._faulted and self._running.is_set() and not self._connected:
-                        self._execute("AT+SCAN=1", None)
                 else:
                     self._execute(command, mac)
             except Exception as exc:
@@ -396,6 +495,7 @@ class SerialGateway:
                 self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
             event.message = f"{event.message or '连接失败'} | {self.CONNECTION_PROFILES[index][0]}"
         logger.info("Connection result mac=%s kind=%s message=%s", mac, event.kind, event.message)
+        self._record(event.kind, f"{mac}: {event.message or event.kind}")
         self.events.put(event)
         return event
 
@@ -404,7 +504,13 @@ class SerialGateway:
         self.recent_lines.append(f"RX {line}")
         logger.info("RX %s", line)
         event = parse_gateway_line(line)
+        if event and event.kind == "warning":
+            self._bad_notify_count += 1
+            self.warning_count += 1
+            self.last_warning = self._record("warning", event.message or "Malformed NOTIFY")
         with self._response:
+            if self._pending_command == "AT+OP?" and line.startswith("+OP:"):
+                self._query_response_seen = True
             if self._pending_command == "AT+CNNI=" and line.startswith(("+CNB:", "+CONN:", "+SERV:", "+CHAR:", "+DISCON:")):
                 self._cnni_payload.append(line)
             if (self._pending_command == "AT+CNNI=" and event and event.kind == "notify"
@@ -412,6 +518,11 @@ class SerialGateway:
                 self._cnni_live[(event.mac, event.handle)] = event
             if line.startswith(("+SC_NTF:", "+NOTIFY:", "+INDICATE:")):
                 self._unsolicited_ok_pending = True
+            if event and event.kind == "disconnected":
+                self._connected.pop(event.mac, None)
+                if not ((self._pending_command or "").startswith("AT+DISCON=")
+                        and event.mac == self._pending_mac):
+                    self._unsolicited_ok_pending = True
             if line == "OK" and self._unsolicited_ok_pending:
                 self._unsolicited_ok_pending = False
                 return
@@ -420,9 +531,11 @@ class SerialGateway:
                 self._connection_result = event
                 return
             if line in {"OK", "ERROR"} and self._pending_command:
+                if line == "OK" and self._pending_command == "AT+OP?" and not self._query_response_seen:
+                    return
                 # Unsolicited scan/notify OKs cannot complete a connection
                 # before the matching +CONN result has arrived.
-                if line == "ERROR" or not self._pending_mac or self._connection_result:
+                if self._terminal is None and (line == "ERROR" or not self._pending_mac or self._connection_result):
                     self._terminal = line
                     self._response.notify_all()
                 return
@@ -434,8 +547,6 @@ class SerialGateway:
                 self._connected[event.mac] = event.handle if event.handle is not None else 0
             elif event.kind == "disconnected" and event.mac:
                 self._connected.pop(event.mac, None)
-            elif event.kind == "error" and (event.message or "").startswith("Malformed NOTIFY"):
-                self._bad_notify_count += 1
             self.events.put(event)
 
     def _read_loop(self) -> None:
@@ -445,6 +556,9 @@ class SerialGateway:
         while self._running.is_set():
             try:
                 raw = self._serial.read(max(1, min(self._serial.in_waiting, 4096)))
+                if raw:
+                    self._last_rx_at = time.monotonic()
+                    self._rx_partial = True
                 non_ascii = sum(byte > 0x7F for byte in raw)
                 if non_ascii:
                     self._non_ascii_bytes += non_ascii
@@ -456,6 +570,7 @@ class SerialGateway:
                     )
                 for line in buffer.feed(raw):
                     self._receive_line(line)
+                self._rx_partial = bool(buffer.pending.strip())
                 if not raw and buffer.pending and bytes(buffer.pending) != reported_partial:
                     reported_partial = bytes(buffer.pending)
                     logger.warning("RX incomplete line (retained) hex=%s", reported_partial.hex())

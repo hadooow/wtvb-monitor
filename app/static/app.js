@@ -60,6 +60,11 @@ function render() {
     ? `网关异常 · ${errorText(gateway.error)}`
     : `${gateway.name} · ${gateway.driver === "simulator" ? "模拟模式" : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开 · 等待网关回复" : "串口已打开 · 已收到网关回复") : "串口未打开"}`;
   badge.classList.toggle("error", Boolean(gateway.error));
+  const warning = $("#gatewayWarning");
+  warning.hidden = !gateway.warning_count;
+  warning.textContent = gateway.warning_count
+    ? `已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`
+    : "";
   const connected = devices.filter(device => device.runtime.status === "connected").length;
   $("#connectedCount").textContent = connected;
   $("#connectionLimit").textContent = `/ ${settings.max_connections} 路连接`;

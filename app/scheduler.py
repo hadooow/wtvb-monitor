@@ -21,6 +21,7 @@ class DeviceRuntime:
     status: str = "queued"
     connected_at: float | None = None
     last_seen: float | None = None
+    last_discovered: float | None = None
     last_sample_at: float | None = None
     last_cycle_at: float = 0.0
     retry_at: float = 0.0
@@ -42,6 +43,10 @@ def select_victim(states: list[DeviceRuntime], focus_mac: str | None, now: float
 
 
 class Scheduler:
+    DISCOVERY_SECONDS = 3.0
+    DISCOVERY_LIMIT_SECONDS = 8.0
+    REDISCOVERY_SECONDS = 30.0
+
     def __init__(
         self,
         database: Database,
@@ -63,6 +68,10 @@ class Scheduler:
         self._connect_ready_at = 0.0
         self.gateway = self._make_gateway()
         self.gateway_error: str | None = None
+        self._serial_batch: list[str] = []
+        self._serial_draining = False
+        self._serial_refresh_at = 0.0
+        self._serial_focus_pending = False
 
     def _eligible_devices(self) -> list[dict[str, Any]]:
         include_simulated = self.settings.gateway_driver == "simulator"
@@ -104,6 +113,10 @@ class Scheduler:
         self.gateway.stop()
         self.decoder = WtvbStreamDecoder()
         self._connect_ready_at = 0.0
+        self._serial_batch.clear()
+        self._serial_draining = False
+        self._serial_refresh_at = 0.0
+        self._serial_focus_pending = bool(self.focus_mac)
         now = time.monotonic()
         for state in self.states.values():
             state.status = "queued"
@@ -112,6 +125,7 @@ class Scheduler:
             state.retry_at = now
             state.error = None
             state.last_seen = None
+            state.last_discovered = None
             state.last_sample_at = None
             state.rssi = None
             state.latest = None
@@ -136,7 +150,7 @@ class Scheduler:
                 self._rotate_completed()
                 self._fill_connections()
             except Exception as exc:
-                self.gateway_error = str(exc)
+                self.gateway_error = self.gateway_error or str(exc)
                 logger.exception("Scheduler iteration failed")
             await asyncio.sleep(0.1)
 
@@ -160,6 +174,14 @@ class Scheduler:
     async def _handle_event(self, event: GatewayEvent) -> None:
         if event.kind not in {"scan", "notify"}:
             logger.info("Gateway event kind=%s mac=%s handle=%s message=%s", event.kind, event.mac, event.handle, event.message)
+        if event.kind == "warning":
+            # A damaged notification is not a failed BLE connection. Discard
+            # its partial frame so a later valid packet cannot complete it.
+            if event.mac:
+                self.decoder.forget(event.mac)
+            else:
+                self.decoder = WtvbStreamDecoder()
+            return
         if event.kind == "error":
             if event.mac:
                 state = self.states.get(event.mac)
@@ -182,7 +204,7 @@ class Scheduler:
                 state.retry_at = time.monotonic() + retry_delay
                 self._connect_ready_at = time.monotonic() + 2.0
             else:
-                self.gateway_error = event.message
+                self.gateway_error = self.gateway_error or event.message
             return
         if not event.mac:
             return
@@ -192,6 +214,7 @@ class Scheduler:
         now = time.monotonic()
         if event.kind == "scan":
             state.last_seen = now
+            state.last_discovered = now
             state.rssi = event.rssi
         elif event.kind == "connected":
             state.status = "connected"
@@ -255,6 +278,8 @@ class Scheduler:
                 logger.error("Scheduler connection timeout mac=%s", state.mac)
 
     def _rotate_completed(self) -> None:
+        if self.settings.gateway_driver == "serial":
+            return  # Serial links rotate as a batch before the next scan.
         if getattr(self.gateway, "busy", False) or any(s.status in {"connecting", "disconnecting"} for s in self.states.values()):
             return
         now = time.monotonic()
@@ -273,6 +298,9 @@ class Scheduler:
                 break
 
     def _fill_connections(self) -> None:
+        if self.settings.gateway_driver == "serial":
+            self._schedule_serial()
+            return
         if getattr(self.gateway, "busy", False):
             return
         now = time.monotonic()
@@ -314,6 +342,93 @@ class Scheduler:
         if candidates:
             self._connect(candidates[0], now)
 
+    def _schedule_serial(self) -> None:
+        """Discover without links, freeze candidates, then collect without scans.
+
+        A batch fills multiple slots sequentially, then streams concurrently.
+        Full batches keep an active focus pinned. Refilling unused slots or
+        switching to an unseen focus releases the batch before fresh discovery.
+        """
+        gateway = self.gateway
+        if gateway.busy:
+            return
+        # Reopening the serial port does not disconnect existing BLE links.
+        # Release unregistered/disabled links rather than scanning over them.
+        for mac in tuple(gateway.active_links):
+            if mac not in self._device_configs:
+                gateway.disconnect(mac)
+                return
+        if any(s.status in {"connecting", "disconnecting"} for s in self.states.values()):
+            return
+        now = time.monotonic()
+        if now < self._connect_ready_at:
+            return
+        active = [s for s in self.states.values() if s.status == "connected"]
+        waiting = [s for s in self.states.values()
+                   if s.status in {"queued", "retrying"} and s.retry_at <= now]
+        if len(active) > self.settings.max_connections:
+            victim = select_victim(active, self.focus_mac, now, 0)
+            if victim:
+                victim.status = "disconnecting"
+                gateway.disconnect(victim.mac)
+            return
+        focus = self.states.get(self.focus_mac)
+        # A focus already in this batch can use a free slot without rediscovery.
+        if self.focus_mac in self._serial_batch:
+            self._serial_batch.remove(self.focus_mac)
+            self._serial_batch.insert(0, self.focus_mac)
+        focus_switch = (self._serial_focus_pending and focus in waiting
+                        and (focus.mac not in self._serial_batch
+                             or len(active) >= self.settings.max_connections))
+        if not self._serial_draining and not focus_switch and len(active) < self.settings.max_connections:
+            while self._serial_batch:
+                candidate = self.states.get(self._serial_batch.pop(0))
+                if candidate in waiting and candidate.mac in self._device_configs:
+                    self._connect(candidate, now)
+                    return
+        # Restarting the app can adopt only one existing link. Rebuild a batch
+        # promptly to fill unused slots, then bound retries for an absent peer.
+        refill = (waiting and len(active) < self.settings.max_connections
+                  and now >= self._serial_refresh_at)
+        expired = (waiting and focus not in active and any(
+            s.connected_at is not None and now - s.connected_at >= self.settings.dwell_seconds
+            for s in active))
+        if active and (focus_switch or refill or expired):
+            self._serial_draining = True
+            self._serial_batch.clear()
+        if self._serial_draining:
+            if active:
+                victim = next((s for s in active if s.mac != self.focus_mac), active[0])
+                victim.status = "disconnecting"
+                gateway.disconnect(victim.mac)
+                return
+            self._serial_draining = False
+        if active or gateway.active_links:
+            return
+        if not waiting:
+            return
+        if gateway.scanning is not True:
+            gateway.scan()
+            return
+        started = gateway.scan_started_at
+        if started is None or now - started < self.DISCOVERY_SECONDS:
+            return
+        candidates = [s for s in waiting if s.last_discovered is not None
+                      and s.last_discovered >= started]
+        enough = len(candidates) >= min(len(waiting), self.settings.max_connections)
+        focus_seen = focus not in waiting or focus in candidates
+        if (not enough or not focus_seen) and now - started < self.DISCOVERY_LIMIT_SECONDS:
+            return
+        if not candidates:
+            return
+        if focus in waiting and focus not in candidates:
+            focus.error = "本轮未发现优先设备，请确认供电、距离及手机连接状态；稍后自动重试"
+        candidates.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, s.failures, s.mac))
+        self._serial_batch = [s.mac for s in candidates]
+        self._serial_focus_pending = False
+        self._serial_refresh_at = now + self.REDISCOVERY_SECONDS
+        gateway.stop_scan()
+
     def _connect(self, state: DeviceRuntime, now: float) -> None:
         logger.info("Schedule connection mac=%s failures=%s rssi=%s", state.mac, state.failures, state.rssi)
         state.status = "connecting"
@@ -324,21 +439,15 @@ class Scheduler:
     def _ready_to_connect(self, state: DeviceRuntime, now: float) -> bool:
         if self.settings.gateway_driver != "serial":
             return True
-        # In serial mode discovery and collection are separate phases. Only
-        # schedule a connection while scanning is actually active; once the
-        # gateway stops scanning for collection, stale discovery timestamps
-        # must not cause another device to connect in parallel.
-        return (
-            getattr(self.gateway, "scanning", False)
-            and state.last_seen is not None
-            and now - state.last_seen <= 10
-        )
+        return state.mac in self._serial_batch and self.gateway.scanning is False
 
     def request_focus(self, mac: str) -> None:
         mac = normalize_mac(mac)
         if mac not in self.states:
             self.states[mac] = DeviceRuntime(mac)
+        self.states[mac].retry_at = min(self.states[mac].retry_at, time.monotonic())
         self.focus_mac = mac
+        self._serial_focus_pending = True
         self.focus_until = time.monotonic() + self.settings.focus_lease_seconds
 
     def heartbeat_focus(self) -> None:
@@ -348,6 +457,7 @@ class Scheduler:
     def clear_focus(self) -> None:
         self.focus_mac = None
         self.focus_until = 0
+        self._serial_focus_pending = False
 
     async def remove_device(self, mac: str) -> None:
         """Stop scheduling a device before its database registration is removed."""
@@ -386,12 +496,14 @@ class Scheduler:
         }
 
     def snapshot(self) -> dict[str, Any]:
+        diagnostics = self.gateway.diagnostics()
+        fault = diagnostics.get("first_fault")
         return {
             "gateway": {
                 "name": self.gateway.name,
                 "driver": self.settings.gateway_driver,
-                "error": self.gateway_error,
-                **self.gateway.diagnostics(),
+                "error": fault["message"] if fault else self.gateway_error,
+                **diagnostics,
                 "connected": sum(state.status == "connected" for state in self.states.values()),
                 "maximum": self.settings.max_connections,
             },

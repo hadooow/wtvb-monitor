@@ -1,4 +1,5 @@
 import threading
+import time
 
 from app.gateway import LineBuffer, SerialGateway, parse_gateway_line
 
@@ -20,6 +21,16 @@ class FakeSerial:
         self.is_open = False
 
 
+def run_commands(gateway):
+    gateway._worker = threading.Thread(target=gateway._command_loop, daemon=True)
+    gateway._worker.start()
+    deadline = time.monotonic() + 2
+    while gateway._commands.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.001)
+    gateway.stop()
+    assert gateway._commands.unfinished_tasks == 0
+
+
 def test_parse_scan_notification():
     event = parse_gateway_line('+SC_NTF:FE6DF407B3E4,0,1,0,-83,127,39,0,16,020105,0,')
     assert event.kind == 'scan'
@@ -27,16 +38,15 @@ def test_parse_scan_notification():
 
 
 def test_parse_notify():
-    event = parse_gateway_line('+NOTIFY:0,FE6DF407B3E4,16,FFE4,1,4,55610000')
+    event = parse_gateway_line('+NOTIFY:0,FE6DF407B3E4,16,FFE4,0,4,55610000')
     assert event.kind == 'notify'
     assert event.payload == b'\x55\x61\x00\x00'
 
 
 def test_parse_notify_rejects_declared_length_mismatch():
-    event = parse_gateway_line('+NOTIFY:0,FE6DF407B3E4,16,FFE4,1,5,55610000')
-    assert event.kind == 'error'
-    assert 'declared=5' in event.message
-    assert 'actual=4' in event.message
+    event = parse_gateway_line('+NOTIFY:0,FE6DF407B3E4,16,FFE4,0,5,55610000')
+    assert event.kind == 'warning'
+    assert 'Malformed NOTIFY' in event.message
 
 
 def test_parse_connection_failure():
@@ -234,30 +244,23 @@ def test_connection_stops_scan_before_connect_and_keeps_it_off_while_collecting(
     assert not any(e.kind == 'error' for e in events)
 
 
-def test_failed_connection_resumes_scan_for_rediscovery():
+def test_failed_connection_leaves_scan_decision_to_scheduler():
     gateway = SerialGateway('COM3', 115200)
-    gateway.COMMAND_TIMEOUT_SECONDS = 0.03
     gateway._running.set()
     gateway._scanning = True
-    mac = 'FE6DF407B3E4'
-
+    mac = '02A000000001'
     def respond(command):
         if command == 'AT+SCAN=0':
             gateway._receive_line('OK')
-        elif command.startswith('AT+CONN='):
+        else:
+            assert command.startswith('AT+CONN=')
             gateway._receive_line(f'+CONN:2,65535,{mac},0,TIMEOUT')
             gateway._receive_line('OK')
-        elif command == 'AT+SCAN=1':
-            gateway._receive_line('OK')
-            gateway._running.clear()
-        else:
-            raise AssertionError(command)
-
     gateway._serial = FakeSerial(respond)
     gateway.connect(mac)
-    gateway._command_loop()
-    assert gateway._serial.writes[-1] == 'AT+SCAN=1'
-    assert gateway.scanning
+    run_commands(gateway)
+    assert len(gateway._serial.writes) == 2
+    assert not gateway.scanning
     assert any(e.kind == 'error' and e.mac == mac for e in gateway.poll())
 
 
