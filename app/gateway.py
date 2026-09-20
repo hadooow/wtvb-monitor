@@ -286,7 +286,7 @@ class SerialGateway:
                 if remaining <= 0:
                     break
                 self._response.wait(min(remaining, 0.2))
-            if not self._running.is_set():
+            if not self._running.is_set() and self._terminal is None:
                 return None
             result, terminal = self._connection_result, self._terminal
             # Field firmware V1.5(2507081320) returns only +CNB:0 for
