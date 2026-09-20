@@ -324,7 +324,15 @@ class Scheduler:
     def _ready_to_connect(self, state: DeviceRuntime, now: float) -> bool:
         if self.settings.gateway_driver != "serial":
             return True
-        return state.last_seen is not None and now - state.last_seen <= 10
+        # In serial mode discovery and collection are separate phases. Only
+        # schedule a connection while scanning is actually active; once the
+        # gateway stops scanning for collection, stale discovery timestamps
+        # must not cause another device to connect in parallel.
+        return (
+            getattr(self.gateway, "scanning", False)
+            and state.last_seen is not None
+            and now - state.last_seen <= 10
+        )
 
     def request_focus(self, mac: str) -> None:
         mac = normalize_mac(mac)
