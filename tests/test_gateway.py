@@ -32,6 +32,13 @@ def test_parse_notify():
     assert event.payload == b'\x55\x61\x00\x00'
 
 
+def test_parse_notify_rejects_declared_length_mismatch():
+    event = parse_gateway_line('+NOTIFY:0,FE6DF407B3E4,16,FFE4,1,5,55610000')
+    assert event.kind == 'error'
+    assert 'declared=5' in event.message
+    assert 'actual=4' in event.message
+
+
 def test_parse_connection_failure():
     event = parse_gateway_line('+CONN:2,0,FE6DF407B3E4,22,DISSCONNECT')
     assert event.kind == 'error'
@@ -195,20 +202,50 @@ def test_empty_list_cannot_finish_bluetooth_connection():
     assert gateway._connection_result is None
 
 
-def test_scan_traffic_does_not_gate_original_sensor_connection():
-    """SCAN=0 stalled in the field; connect must reach the wire directly."""
+def test_connection_stops_scan_before_connect_and_keeps_it_off_while_collecting():
     gateway = SerialGateway('COM3', 115200)
     gateway.COMMAND_TIMEOUT_SECONDS = 0.03
     gateway._running.set()
+    gateway._scanning = True
     mac = 'FE6DF407B3E4'
 
     def respond(command):
-        if command.startswith('AT+CONN='):
-            gateway._receive_line(f'+SC_NTF:{mac},0,1,0,-46,127,37,0,16,020105,0,')
+        if command == 'AT+SCAN=0':
             gateway._receive_line('OK')
-            assert gateway._terminal is None
+        elif command.startswith('AT+CONN='):
             gateway._receive_line(f'+CONN:2,0,{mac},4,247')
             gateway._receive_line('+CHAR:2,FFE4,0,0,0,0,1,0,0')
+            gateway._receive_line('OK')
+            gateway._running.clear()
+        else:
+            raise AssertionError(command)
+
+    gateway._serial = FakeSerial(respond)
+    gateway.connect(mac)
+    gateway._command_loop()
+    assert gateway._serial.writes == [
+        'AT+SCAN=0',
+        f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0',
+    ]
+    assert not gateway._faulted
+    assert not gateway.scanning
+    events = gateway.poll()
+    assert any(e.kind == 'connected' and e.mac == mac for e in events)
+    assert not any(e.kind == 'error' for e in events)
+
+
+def test_failed_connection_resumes_scan_for_rediscovery():
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = 0.03
+    gateway._running.set()
+    gateway._scanning = True
+    mac = 'FE6DF407B3E4'
+
+    def respond(command):
+        if command == 'AT+SCAN=0':
+            gateway._receive_line('OK')
+        elif command.startswith('AT+CONN='):
+            gateway._receive_line(f'+CONN:2,65535,{mac},0,TIMEOUT')
             gateway._receive_line('OK')
         elif command == 'AT+SCAN=1':
             gateway._receive_line('OK')
@@ -219,11 +256,9 @@ def test_scan_traffic_does_not_gate_original_sensor_connection():
     gateway._serial = FakeSerial(respond)
     gateway.connect(mac)
     gateway._command_loop()
-    assert gateway._serial.writes == [f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0', 'AT+SCAN=1']
-    assert not gateway._faulted
-    events = gateway.poll()
-    assert any(e.kind == 'connected' and e.mac == mac for e in events)
-    assert not any(e.kind == 'error' for e in events)
+    assert gateway._serial.writes[-1] == 'AT+SCAN=1'
+    assert gateway.scanning
+    assert any(e.kind == 'error' and e.mac == mac for e in gateway.poll())
 
 
 def test_v04_original_sensor_command_uses_scanned_address():
@@ -258,24 +293,23 @@ def test_other_device_disconnect_does_not_finish_pending_connection():
     assert len(events) == 1 and events[0].kind == 'disconnected'
 
 
-def test_nonempty_query_confirmed_by_live_data_resumes_scan():
+def test_nonempty_query_confirmed_by_live_data_keeps_scan_off():
     gateway = SerialGateway('COM3', 115200)
     gateway.COMMAND_TIMEOUT_SECONDS = 0.01
     gateway._running.set()
+
     def respond(command):
-        if command == 'AT+CNNI=':
-            for line in ['+CNB:1', '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000', 'OK']:
-                gateway._receive_line(line)
-        else:
-            assert command == 'AT+SCAN=1'
-            gateway._receive_line('OK')
-            gateway._running.clear()
+        assert command == 'AT+CNNI='
+        for line in ['+CNB:1', '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000', 'OK']:
+            gateway._receive_line(line)
+
     gateway._serial = FakeSerial(respond)
-    gateway.send('AT+CNNI=')
-    gateway.send('AT+SCAN=1')
-    gateway._command_loop()
+    gateway._execute('AT+CNNI=', None)
+
     assert not gateway._faulted
-    assert gateway._serial.writes == ['AT+CNNI=', 'AT+SCAN=1']
+    assert gateway._serial.writes == ['AT+CNNI=']
+    assert not gateway.scanning
+    assert gateway._connected == {'FE6DF407B3E4': 0}
     assert any(e.kind == 'connected' and e.mac == 'FE6DF407B3E4' for e in gateway.poll())
 
 

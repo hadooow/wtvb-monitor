@@ -143,3 +143,38 @@ def test_field_disconnect_clears_phantom_connection(tmp_path):
     assert runtime.handle is None and runtime.last_sample_at is None
     assert mac not in scheduler.decoder._buffers
     assert '8' in scheduler.status_dict(mac)['error']
+
+
+def test_serial_connect_requires_active_scan_phase(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+
+    async def publish(_):
+        pass
+
+    settings = Settings(gateway_driver='serial')
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), settings, publish)
+    mac = 'FE6DF407B3E4'
+    scheduler.states = {mac: DeviceRuntime(mac, last_seen=time.monotonic())}
+    scheduler.gateway = SimpleNamespace(scanning=False, busy=False)
+
+    assert scheduler._ready_to_connect(scheduler.states[mac], time.monotonic()) is False
+
+    scheduler.gateway.scanning = True
+    assert scheduler._ready_to_connect(scheduler.states[mac], time.monotonic()) is True
+
+
+def test_serial_connect_rejects_stale_scan_even_when_scanning(tmp_path):
+    from app.config import Settings
+    from app.database import Database
+
+    async def publish(_):
+        pass
+
+    settings = Settings(gateway_driver='serial')
+    scheduler = Scheduler(Database(tmp_path / 'test.db'), settings, publish)
+    mac = 'FE6DF407B3E4'
+    scheduler.states = {mac: DeviceRuntime(mac, last_seen=time.monotonic() - 11)}
+    scheduler.gateway = SimpleNamespace(scanning=True, busy=False)
+
+    assert scheduler._ready_to_connect(scheduler.states[mac], time.monotonic()) is False
