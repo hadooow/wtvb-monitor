@@ -293,24 +293,23 @@ def test_other_device_disconnect_does_not_finish_pending_connection():
     assert len(events) == 1 and events[0].kind == 'disconnected'
 
 
-def test_nonempty_query_confirmed_by_live_data_resumes_scan():
+def test_nonempty_query_confirmed_by_live_data_keeps_scan_off():
     gateway = SerialGateway('COM3', 115200)
     gateway.COMMAND_TIMEOUT_SECONDS = 0.01
     gateway._running.set()
+
     def respond(command):
-        if command == 'AT+CNNI=':
-            for line in ['+CNB:1', '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000', 'OK']:
-                gateway._receive_line(line)
-        else:
-            assert command == 'AT+SCAN=1'
-            gateway._receive_line('OK')
-            gateway._running.clear()
+        assert command == 'AT+CNNI='
+        for line in ['+CNB:1', '+NOTIFY:0,FE6DF407B3E4,15,FFE4,0,4,55610000', 'OK']:
+            gateway._receive_line(line)
+
     gateway._serial = FakeSerial(respond)
-    gateway.send('AT+CNNI=')
-    gateway.send('AT+SCAN=1')
-    gateway._command_loop()
+    gateway._execute('AT+CNNI=', None)
+
     assert not gateway._faulted
-    assert gateway._serial.writes == ['AT+CNNI=', 'AT+SCAN=1']
+    assert gateway._serial.writes == ['AT+CNNI=']
+    assert not gateway.scanning
+    assert gateway._connected == {'FE6DF407B3E4': 0}
     assert any(e.kind == 'connected' and e.mac == 'FE6DF407B3E4' for e in gateway.poll())
 
 
