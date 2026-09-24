@@ -139,7 +139,7 @@ def test_terminator_missing_recovers_instead_of_faulting_the_gateway(monkeypatch
     gateway = SerialGateway('COM3', 115200)
     gateway._serial = FakeSerial()
     gateway._running.set()
-    ticks = iter([0, 100])
+    ticks = iter([0, 0, 100])
     monkeypatch.setattr('app.gateway.time.monotonic', lambda: next(ticks))
     gateway._execute('AT+CONN=test', 'FE6DF407B3E4')
     assert gateway._desynced and not gateway._faulted and gateway.busy

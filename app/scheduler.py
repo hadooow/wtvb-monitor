@@ -449,6 +449,22 @@ class Scheduler:
         focus_switch = (self._serial_focus_pending and focus in waiting
                         and (focus.mac not in self._serial_batch
                              or len(active) >= limit))
+        needs_fresh_discovery = any(s.mac not in self._serial_candidates for s in waiting)
+        oldest_dwell_complete = any(
+            s.mac != self.focus_mac and s.connected_at is not None
+            and now - s.connected_at >= self.settings.dwell_seconds
+            for s in active
+        )
+        if (active and not self._serial_draining and not focus_switch
+                and not (focus and focus.status == "connected")
+                and oldest_dwell_complete
+                and now >= self._serial_refresh_at and needs_fresh_discovery):
+            # New registrations and devices missed by the last scan need a
+            # fresh discovery window. The gateway cannot scan while any BLE
+            # link remains active, so drain this batch before scanning.
+            self._serial_draining = True
+            self._serial_batch.clear()
+            self._serial_candidates.clear()
         if not self._serial_draining and not focus_switch and any(
             s.last_sample_at is None or now - s.last_sample_at > 10.0
             or s.data_stable_since is None or now - s.data_stable_since < self.DATA_SETTLE_SECONDS
@@ -558,7 +574,7 @@ class Scheduler:
             # rotation; avoid sending a duplicate AT+DISCON transaction.
             state.disconnect_requested = True
             state.status = "disconnecting"
-        elif state.status in {"connected", "connecting"} or mac in self.gateway.active_links:
+        elif state.status in {"connected", "connecting"} or mac in getattr(self.gateway, "active_links", {}):
             if not state.disconnect_requested:
                 state.disconnect_requested = True
                 self.gateway.disconnect(mac)

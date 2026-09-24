@@ -343,6 +343,7 @@ class SerialGateway:
 
     def _execute(self, command: str, mac: str | None) -> GatewayEvent | None:
         """Only one AT transaction can own the reply stream."""
+        invalid_connection_snapshot = False
         timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
         if command.startswith("AT+DISCON="):
             timeout = self.DISCONNECT_TIMEOUT_SECONDS
@@ -363,7 +364,7 @@ class SerialGateway:
             self._query_response_seen = False
             self._scan_query_state = None
             self._disconnect_accepted = False
-            self._pending_since = time.perf_counter()
+            self._pending_since = time.monotonic()
             self._pending_non_ascii_start = self._non_ascii_bytes
             self._collision_detected = False
             self._last_transaction_success = False
@@ -384,7 +385,6 @@ class SerialGateway:
                         command.startswith("AT+DISCON=") and self._connection_result is None and not self._disconnect_accepted
                         or command in {"AT+SCAN=0", "AT+SCAN=1"}
                         or command in {"AT+OP?", "AT+SCAN?"} and not self._query_response_seen
-                        or command == "AT+CNNI=" and not self._cnni_payload
                     )
                     if retryable and retries < self.IDEMPOTENT_RETRIES:
                         if self._reader is not None and not self._wait_tx_gap():
@@ -461,17 +461,29 @@ class SerialGateway:
                 count = len(self._cnni_live)
                 if (count and self._cnni_payload == [f"+CNB:{count}"]
                         and len({mac for mac, _ in self._cnni_live}) == count
-                        and len({handle for _, handle in self._cnni_live}) == count):
+                        and len({handle for _, handle in self._cnni_live}) == count
+                        and not self._cnni_listing
+                        and not any(line.startswith("+DISCON:") for line in self._cnni_payload)):
                     self._replace_connection_snapshot({mac: handle for mac, handle in self._cnni_live})
                     for event in self._cnni_live.values():
                         self.events.put(GatewayEvent("connected", event.mac, handle=event.handle))
                     self._connection_snapshot_complete = True
+            if (command == "AT+CNNI=" and terminal == "OK"
+                    and not self._connection_snapshot_complete):
+                invalid_connection_snapshot = True
+                self._desynced = True
+                self._record("transaction_fault", "AT_INVALID_CONNECTION_SNAPSHOT: incomplete or conflicting AT+CNNI= response")
             if self._collision_detected:
                 terminal = None
                 self._desynced = True
                 self._record("transaction_fault", f"SERIAL_COLLISION_SUSPECTED: {command}")
             self._pending_command = None
             self._pending_mac = None
+        if invalid_connection_snapshot:
+            message = "AT_INVALID_CONNECTION_SNAPSHOT: 网关连接列表不完整或互相矛盾，正在重新同步"
+            self._last_transaction_success = False
+            self.events.put(GatewayEvent("error", message=message))
+            return None
         if terminal is None:
             # A late reply cannot own the next transaction. Keep the reader
             # alive and recover reply ownership with AT+CNNI= in the worker.
@@ -486,6 +498,8 @@ class SerialGateway:
             self._last_transaction_success = False
             if mac:
                 result = self._finish_connection(GatewayEvent("error", mac, message=message))
+            else:
+                self.events.put(GatewayEvent("error", message=message))
             return result
         self._last_transaction_success = terminal != "ERROR"
         if terminal != "ERROR":

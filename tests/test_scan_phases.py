@@ -22,7 +22,8 @@ def test_unconfirmed_scan_stop_never_sends_connection(reply):
     g._serial = FakeSerial(lambda _: [g._receive_line(line) for line in reply])
     g.connect(MACS[0])
     run_commands(g)
-    assert g._serial.writes == ['AT+SCAN=0'] * (1 if reply == ['ERROR'] else 3)
+    expected = ['AT+SCAN=0'] if reply == ['ERROR'] else ['AT+SCAN=0'] * 3 + ['AT+CNNI='] * 3
+    assert g._serial.writes == expected
     assert g._faulted and g.first_fault
     first = g.first_fault.copy()
     g._receive_line('OK')  # A late reply cannot unpause the worker.
@@ -174,11 +175,14 @@ def test_frozen_batch_survives_slow_connection_and_never_scans_over_links(phase_
     assert [c for c in s.gateway.calls if c[0] == 'scan'] == [('scan',)]
 
 
-def test_dwell_drains_whole_batch_then_requires_fresh_discovery(phase_scheduler):
+def test_dwell_releases_one_link_and_fills_the_freed_slot(phase_scheduler):
     s, clock = phase_scheduler
     for i, mac in enumerate(MACS[:2]):
         event(s, 'connected', mac, i)
         s.states[mac].last_discovered = 90
+    s._serial_batch = [MACS[2]]
+    s._serial_candidates = set(MACS)
+    s._serial_refresh_at = clock[0] + 1000
     clock[0] += 65
     for peer in MACS[:2]:
         if s.states[peer].status == "connected":
@@ -188,18 +192,32 @@ def test_dwell_drains_whole_batch_then_requires_fresh_discovery(phase_scheduler)
     event(s, 'disconnected', MACS[0])
     clock[0] += 2
     s._fill_connections()
-    assert s.gateway.calls[-1] == ('disconnect', MACS[1])
-    event(s, 'disconnected', MACS[1])
+    assert s.gateway.calls[-1] == ('connect', MACS[2])
+
+
+def test_four_devices_rotate_with_three_links_without_clearing_peers(phase_scheduler):
+    s, clock = phase_scheduler
+    fourth = '02A000000004'
+    s.settings.max_connections = 4
+    s.states[fourth] = DeviceRuntime(fourth)
+    s._device_configs[fourth] = {'mac': fourth}
+    for i, mac in enumerate(MACS):
+        event(s, 'connected', mac, i)
+    s._serial_batch = [fourth]
+    s._serial_candidates = set(MACS) | {fourth}
+    s._serial_refresh_at = clock[0] + 1000
+    s._fill_connections()
+    assert s.gateway.calls == []
+    clock[0] += s.settings.dwell_seconds + 1
+    for mac in MACS:
+        sample(s, mac)
+    s._fill_connections()
+    assert s.gateway.calls == [('disconnect', MACS[0])]
+    event(s, 'disconnected', MACS[0])
     clock[0] += 2
     s._fill_connections()
-    assert s.gateway.calls[-1] == ('scan',)
-    clock[0] += 9
-    s._fill_connections()
-    assert s.gateway.calls[-1] == ('scan',)  # Old RSSI cannot start the new batch.
-    event(s, 'scan', MACS[2])
-    s._fill_connections()
-    s._fill_connections()
-    assert s.gateway.calls[-1] == ('connect', MACS[2])
+    assert s.gateway.calls[-1] == ('connect', fourth)
+    assert set(s.gateway.active_links) == set(MACS[1:])
 
 
 def test_unseen_focus_releases_current_link_to_rediscover(phase_scheduler):
@@ -271,13 +289,17 @@ def test_repeated_focus_between_connected_devices_keeps_both_streams(phase_sched
     assert not s.gateway.calls
 
 
-def test_new_registration_requests_discovery_without_waiting_for_dwell(phase_scheduler):
+def test_new_registration_waits_for_dwell_before_discovery(phase_scheduler):
     s, clock = phase_scheduler
     event(s, 'connected', MACS[0])
     clock[0] += 3
     s._fill_connections()
     assert s.gateway.calls == []
     s._serial_refresh_at = 0  # _sync_devices requests discovery for a new registration.
+    s._fill_connections()
+    assert s.gateway.calls == []
+    clock[0] += s.settings.dwell_seconds
+    sample(s, MACS[0])
     s._fill_connections()
     assert s.gateway.calls == [('disconnect', MACS[0])]
     event(s, 'disconnected', MACS[0])
