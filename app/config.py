@@ -25,7 +25,8 @@ class Settings:
     gateway_driver: str = "simulator"
     serial_port: str = "COM3"
     baudrate: int = 115200
-    max_connections: int = 5
+    max_connections: int = 4
+    serial_concurrency_limit: int = 3
     dwell_seconds: int = 180
     connect_timeout_seconds: int = 40
     reconnect_base_seconds: int = 10
@@ -58,6 +59,8 @@ class Settings:
             raise ValueError("gateway_driver must be simulator or serial")
         if not 1 <= int(self.max_connections) <= 7:
             raise ValueError("max_connections must be between 1 and 7")
+        if not 1 <= int(self.serial_concurrency_limit) <= 7:
+            raise ValueError("serial_concurrency_limit must be between 1 and 7")
         if not 60 <= int(self.dwell_seconds) <= 300:
             raise ValueError("dwell_seconds must be between 60 and 300")
         if not 5 <= int(self.connect_timeout_seconds) <= 60:

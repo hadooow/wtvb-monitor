@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import sqlite3
 import os
 import threading
 import webbrowser
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -45,6 +48,7 @@ class SettingsUpdate(BaseModel):
     baudrate: int | None = Field(None, ge=1200, le=921600)
     connect_timeout_seconds: int | None = Field(None, ge=5, le=60)
     max_connections: int | None = Field(None, ge=1, le=7)
+    serial_concurrency_limit: int | None = Field(None, ge=1, le=7)
     dwell_seconds: int | None = Field(None, ge=60, le=300)
     reconnect_base_seconds: int | None = Field(None, ge=5, le=600)
     focus_lease_seconds: int | None = Field(None, ge=10, le=300)
@@ -123,138 +127,4 @@ async def reconnect_gateway():
     return {"ok": True, "gateway": scheduler.snapshot()["gateway"]}
 
 
-@app.get("/api/dashboard")
-def dashboard():
-    latest = database.latest_samples()
-    snapshot = scheduler.snapshot()
-    devices = []
-    for device in database.list_devices():
-        runtime = snapshot["devices"].get(device["mac"], {"status": "disabled", "is_focus": False})
-        if not runtime.get("latest"):
-            stored = latest.get(device["mac"])
-            if stored and stored.get("source") == settings.gateway_driver:
-                runtime["latest"] = stored
-        devices.append({**device, "runtime": runtime})
-    return {"settings": settings.public_dict(), "gateway": snapshot["gateway"], "focus_mac": snapshot["focus_mac"], "devices": devices}
-
-
-@app.post("/api/devices")
-def add_device(payload: DeviceCreate):
-    try:
-        return database.add_device(payload.model_dump())
-    except (ValueError, Exception) as exc:
-        if "UNIQUE constraint" in str(exc):
-            raise HTTPException(409, "该MAC地址已经存在") from exc
-        raise HTTPException(400, str(exc)) from exc
-
-
-@app.patch("/api/devices/{device_id}")
-async def update_device(device_id: int, payload: DeviceUpdate):
-    device = database.get_device(device_id)
-    if not device:
-        raise HTTPException(404, "设备不存在")
-    values = payload.model_dump(exclude_none=True)
-    try:
-        if "mac" in values:
-            values["mac"] = normalize_mac(values["mac"])
-    except ValueError as exc:
-        raise HTTPException(400, "MAC 地址格式无效，请输入 12 位十六进制地址") from exc
-    changing_mac = "mac" in values and values["mac"] != device["mac"]
-    state = scheduler.states.get(device["mac"])
-    if changing_mac and state and state.status in {"connected", "connecting", "disconnecting"}:
-        if scheduler.gateway.online and not getattr(scheduler.gateway, "_faulted", False):
-            raise HTTPException(409, "设备正在连接或采集，请先停用设备，等待连接结束后再修改 MAC")
-    try:
-        result = database.update_device(device_id, values)
-    except sqlite3.IntegrityError as exc:
-        raise HTTPException(409, "该 MAC 地址已被其他设备使用") from exc
-    if changing_mac:
-        await scheduler.remove_device(device["mac"])
-        scheduler._sync_devices()
-        logging.getLogger(__name__).info("Device MAC updated id=%s old=%s new=%s", device_id, device["mac"], values["mac"])
-    return result
-
-
-@app.get("/api/devices/{device_id}/history")
-def device_history(
-    device_id: int,
-    limit: int = Query(720, ge=1, le=20000),
-    minutes: int | None = Query(None, ge=1, le=10080),
-):
-    if not database.get_device(device_id):
-        raise HTTPException(404, "设备不存在")
-    if minutes is not None:
-        return database.history_since(device_id, minutes, limit)
-    return database.history(device_id, limit)
-
-
-@app.delete("/api/devices/{device_id}")
-async def delete_device(device_id: int):
-    device = database.get_device(device_id)
-    if not device:
-        raise HTTPException(404, "设备不存在")
-    await scheduler.remove_device(device["mac"])
-    database.delete_device(device_id)
-    return {"ok": True}
-
-
-@app.post("/api/devices/{device_id}/focus")
-async def focus_device(device_id: int):
-    device = database.get_device(device_id)
-    if not device:
-        raise HTTPException(404, "设备不存在")
-    if not device["enabled"]:
-        raise HTTPException(409, "设备已停用")
-    scheduler.request_focus(device["mac"])
-    await hub.publish({"type": "snapshot", "snapshot": scheduler.snapshot()})
-    return {"ok": True, "focus_mac": device["mac"]}
-
-
-@app.post("/api/focus/heartbeat")
-def focus_heartbeat():
-    scheduler.heartbeat_focus()
-    return {"ok": True}
-
-
-@app.delete("/api/focus")
-async def clear_focus():
-    scheduler.clear_focus()
-    await hub.publish({"type": "snapshot", "snapshot": scheduler.snapshot()})
-    return {"ok": True}
-
-
-@app.patch("/api/settings")
-async def update_settings(payload: SettingsUpdate):
-    values = payload.model_dump(exclude_none=True)
-    requires_gateway_restart = any(
-        key in values and values[key] != getattr(settings, key)
-        for key in ("gateway_driver", "serial_port", "baudrate", "connect_timeout_seconds")
-    )
-    try:
-        settings.update(values)
-        settings.save()
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    if requires_gateway_restart:
-        await scheduler.restart_gateway()
-    logging.getLogger(__name__).info("Settings updated: %s", values)
-    return settings.public_dict()
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(socket: WebSocket):
-    await hub.connect(socket)
-    await socket.send_json({"type": "snapshot", "snapshot": scheduler.snapshot()})
-    try:
-        while True:
-            message = await socket.receive_text()
-            if message == "focus-heartbeat":
-                scheduler.heartbeat_focus()
-    except WebSocketDisconnect:
-        hub.disconnect(socket)
-
-
-def run() -> None:
-    if os.environ.get("WTVB_NO_BROWSER") != "1":
-        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{settings.port}")).start()
-    uvicorn.run(app, host=settings.host, port=settings.port, reload=False, log_config=None)
+@app.get("/
