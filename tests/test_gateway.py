@@ -146,6 +146,20 @@ def test_terminator_missing_recovers_instead_of_faulting_the_gateway(monkeypatch
     assert any('AT_RESPONSE_TIMEOUT' in (e.message or '') for e in gateway.poll())
 
 
+def test_disconnect_timeout_does_not_rotate_successful_connection_profile():
+    mac = 'FE6DF407B3E4'
+    gateway = SerialGateway('COM3', 115200)
+    gateway._preferred_profile[mac] = 0
+    gateway._profile_cursor[mac] = 0
+    gateway._serial = FakeSerial()
+    gateway._running.set()
+    gateway.DISCONNECT_TIMEOUT_SECONDS = 0.01
+    result = gateway._execute(f'AT+DISCON=,{mac}', mac)
+    assert result.kind == 'error' and gateway._desynced
+    assert gateway._preferred_profile[mac] == 0
+    assert gateway._profile_cursor[mac] == 0
+
+
 def test_field_empty_connection_list_resumes_startup_scan():
     """Replay the field firmware's CNB:0 reply without an additional OK."""
     gateway = SerialGateway('COM3', 115200)

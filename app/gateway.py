@@ -641,11 +641,14 @@ class SerialGateway:
         elif mac and event.kind == "disconnected":
             self._connected.pop(mac, None)
         elif mac and event.kind == "error":
-            index = self._active_profile.pop(mac, self._profile_cursor.get(mac, 0))
-            self._preferred_profile.pop(mac, None)
-            if "CNN_BUSY" not in (event.message or ""):
-                self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
-            event.message = f"{event.message or '连接失败'} | {self.CONNECTION_PROFILES[index][0]}"
+            # A failed DISCON transaction says nothing about the next CONN
+            # profile. Only a failed connection attempt should rotate it.
+            index = self._active_profile.pop(mac, None)
+            if index is not None:
+                self._preferred_profile.pop(mac, None)
+                if "CNN_BUSY" not in (event.message or ""):
+                    self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
+                event.message = f"{event.message or '连接失败'} | {self.CONNECTION_PROFILES[index][0]}"
         logger.info("Connection result mac=%s kind=%s message=%s", mac, event.kind, event.message)
         self._record(event.kind, f"{mac}: {event.message or event.kind}")
         self.events.put(event)

@@ -139,7 +139,9 @@ def dashboard():
             if stored and stored.get("source") == settings.gateway_driver:
                 runtime["latest"] = stored
         devices.append({**device, "runtime": runtime})
-    return {"settings": settings.public_dict(), "gateway": snapshot["gateway"], "focus_mac": snapshot["focus_mac"], "devices": devices}
+    return {"settings": settings.public_dict(), "gateway": snapshot["gateway"],
+            "focus_mac": snapshot["focus_mac"], "queue_order": snapshot["queue_order"],
+            "devices": devices}
 
 
 @app.post("/api/devices")

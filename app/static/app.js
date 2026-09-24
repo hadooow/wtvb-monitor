@@ -91,14 +91,25 @@ function renderCards(devices) {
     grid.innerHTML = '<div class="empty-state"><strong>尚未登记设备</strong><span>点击右上角“添加设备”开始配置传感器。</span></div>';
     return;
   }
-  grid.innerHTML = devices.map(device => {
+  const queueRank = new Map((state.dashboard?.queue_order || []).map((mac, index) => [mac, index]));
+  const statusRank = { connected: 0, connecting: 1, disconnecting: 2, queued: 3, retrying: 3, paused: 4, disabled: 5 };
+  const ordered = [...devices].sort((a, b) => {
+    const aRank = statusRank[a.runtime.status] ?? 5;
+    const bRank = statusRank[b.runtime.status] ?? 5;
+    if (aRank !== bRank) return aRank - bRank;
+    if (aRank === 0) return (a.runtime.handle ?? a.id) - (b.runtime.handle ?? b.id);
+    if (aRank === 3) return (queueRank.get(a.mac) ?? Infinity) - (queueRank.get(b.mac) ?? Infinity);
+    return a.id - b.id;
+  });
+  grid.innerHTML = ordered.map(device => {
     const runtime = device.runtime;
     const live = Boolean(runtime.collecting);
     const sample = live ? runtime.latest : null;
     const alarm = live ? (runtime.alarm || { level: "normal", reasons: [] }) : { level: "normal", reasons: [] };
     const badgeClass = alarm.level !== "normal" ? alarm.level : runtime.status;
     const connectionLabel = runtime.status === "connected" && !live ? "已连接 · 等待数据" : statusNames[runtime.status] || runtime.status;
-    const badgeText = alarm.level === "alarm" ? "报警" : alarm.level === "warning" ? "预警" : runtime.is_focus && live ? "实时优先" : runtime.is_focus ? `${connectionLabel} · 已优先` : connectionLabel;
+    const queuePosition = queueRank.has(device.mac) ? ` · 排队第 ${queueRank.get(device.mac) + 1} 位` : "";
+    const badgeText = alarm.level === "alarm" ? `${connectionLabel} · 报警` : alarm.level === "warning" ? `${connectionLabel} · 预警` : runtime.is_focus && live ? `${connectionLabel} · 实时优先` : runtime.is_focus ? `${connectionLabel} · 已优先` : `${connectionLabel}${queuePosition}`;
     const alarmReason = alarm.reasons?.map(item => `${item.label} ${fmt(item.value)} ${item.unit}`).join(" · ") || "";
     const reason = alarmReason || (runtime.error ? `连接失败：${errorText(runtime.error)}` : "");
     const timeText = sample ? new Date(sample.timestamp).toLocaleTimeString() : live ? "等待数据" : "当前未采集";
@@ -524,6 +535,13 @@ function connectSocket() {
     if (message.type === "sample") acceptSample(message.mac, message.sample, message.status);
     if (message.type === "snapshot") {
       state.focusMac = message.snapshot.focus_mac;
+      if (state.dashboard) {
+        state.dashboard.queue_order = message.snapshot.queue_order || [];
+        for (const device of state.dashboard.devices) {
+          if (message.snapshot.devices[device.mac]) device.runtime = message.snapshot.devices[device.mac];
+        }
+        render();
+      }
       if ($("#monitorDialog").open) renderMonitor();
     }
   };

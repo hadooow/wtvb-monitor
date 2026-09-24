@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import project_root
 
-VERSION = "0.6.8"
+VERSION = "0.6.9"
 
 
 def configure_logging(directory: Path | None = None) -> Path:

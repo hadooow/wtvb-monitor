@@ -75,6 +75,15 @@ def test_manual_disconnect_stays_paused_until_reconnect(api):
     assert not state.manual_paused and state.status == 'queued'
 
 
+def test_dashboard_exposes_upcoming_queue_order(api):
+    client, db, scheduler = api
+    dashboard = client.get('/api/dashboard').json()
+    assert dashboard['queue_order'] == scheduler.queue_order()
+    assert set(dashboard['queue_order']) == {
+        device['mac'] for device in dashboard['devices'] if device['enabled']
+    }
+
+
 def test_history_chart_limit_table_and_csv_export(api):
     client, db, _ = api
     device = db.get_device_by_mac('E8C5C0B8917E')

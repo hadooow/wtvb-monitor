@@ -410,12 +410,7 @@ class Scheduler:
             self._connect(candidates[0], now)
 
     def _schedule_serial(self) -> None:
-        """Discover without links, freeze candidates, then collect without scans.
-
-        A batch fills multiple slots sequentially, then streams concurrently.
-        Full batches keep an active focus pinned. Refilling unused slots or
-        switching to an unseen focus releases the batch before fresh discovery.
-        """
+        """Collect for a full dwell, then discover and connect the next batch."""
         gateway = self.gateway
         if gateway.busy:
             return
@@ -449,19 +444,18 @@ class Scheduler:
         focus_switch = (self._serial_focus_pending and focus in waiting
                         and (focus.mac not in self._serial_batch
                              or len(active) >= limit))
-        needs_fresh_discovery = any(s.mac not in self._serial_candidates for s in waiting)
-        oldest_dwell_complete = any(
-            s.mac != self.focus_mac and s.connected_at is not None
+        batch_ready = any(s.mac in self._serial_candidates for s in waiting)
+        dwell_complete = bool(active) and all(
+            s.connected_at is not None
             and now - s.connected_at >= self.settings.dwell_seconds
             for s in active
         )
-        if (active and not self._serial_draining and not focus_switch
+        if (not self._serial_draining and not focus_switch and waiting
                 and not (focus and focus.status == "connected")
-                and oldest_dwell_complete
-                and now >= self._serial_refresh_at and needs_fresh_discovery):
-            # New registrations and devices missed by the last scan need a
-            # fresh discovery window. The gateway cannot scan while any BLE
-            # link remains active, so drain this batch before scanning.
+                and dwell_complete
+                and (len(active) >= limit or (not batch_ready and now >= self._serial_refresh_at))):
+            # Do not reconnect a just-completed device into the channel freed
+            # by its own rotation. Finish this batch, then scan for the next.
             self._serial_draining = True
             self._serial_batch.clear()
             self._serial_candidates.clear()
@@ -484,27 +478,17 @@ class Scheduler:
                 retries.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, s.failures))
                 self._connect(retries[0], now)
                 return
-        # Free one channel at a time after its dwell expires. With three busy
-        # streams, never drop the whole batch just to admit a fourth device.
-        if (waiting and len(active) >= limit and not self._serial_draining
-                and not focus_switch):
-            completed = [s for s in active if s.mac != self.focus_mac
-                         and s.connected_at is not None
-                         and now - s.connected_at >= self.settings.dwell_seconds]
-            if completed:
-                victim = min(completed, key=lambda s: s.connected_at or 0)
-                victim.status = "disconnecting"
-                gateway.disconnect(victim.mac)
-                return
         if active and focus_switch:
             self._serial_draining = True
             self._serial_batch.clear()
             self._serial_candidates.clear()
         if self._serial_draining:
             if active:
-                victim = next((s for s in active if s.mac != self.focus_mac), active[0])
+                victim = min(active, key=lambda s: s.connected_at or 0)
                 victim.status = "disconnecting"
                 gateway.disconnect(victim.mac)
+                return
+            if gateway.active_links:
                 return
             self._serial_draining = False
         if active or gateway.active_links:
@@ -521,13 +505,16 @@ class Scheduler:
                       and s.last_discovered >= started]
         enough = len(candidates) >= min(len(waiting), limit)
         focus_seen = focus not in waiting or focus in candidates
-        if (not enough or not focus_seen) and now - started < self.DISCOVERY_LIMIT_SECONDS:
+        # With more registered devices than channels, use the whole discovery
+        # window so slower advertisements can enter the next batch.
+        full_window = len(waiting) > limit and not (focus in waiting and focus in candidates)
+        if (full_window or not enough or not focus_seen) and now - started < self.DISCOVERY_LIMIT_SECONDS:
             return
         if not candidates:
             return
         if focus in waiting and focus not in candidates:
             focus.error = "本轮未发现优先设备，请确认供电、距离及手机连接状态；稍后自动重试"
-        candidates.sort(key=lambda s: (s.mac != self.focus_mac, s.last_cycle_at, not s.verified, s.failures, s.mac))
+        candidates.sort(key=self._queue_sort_key)
         self._serial_batch = [s.mac for s in candidates]
         self._serial_candidates = set(self._serial_batch)
         self._serial_focus_pending = False
@@ -559,6 +546,32 @@ class Scheduler:
         if self.settings.gateway_driver == "serial":
             return min(self.settings.max_connections, self.settings.serial_concurrency_limit)
         return self.settings.max_connections
+
+    def _queue_sort_key(self, state: DeviceRuntime) -> tuple:
+        return (state.mac != self.focus_mac, state.last_cycle_at,
+                not state.verified, state.failures, state.mac)
+
+    def queue_order(self) -> list[str]:
+        """Return the current best estimate of connection order for the UI."""
+        now = time.monotonic()
+        waiting = [s for s in self.states.values()
+                   if not s.manual_paused and s.status in {"queued", "retrying"}]
+        ready = [s for s in waiting if s.retry_at <= now]
+        delayed = [s for s in waiting if s.retry_at > now]
+        if (self.settings.gateway_driver == "serial" and not self._serial_draining
+                and sum(s.status == "connected" for s in self.states.values()) < self._connection_limit()):
+            batch = [self.states[mac] for mac in self._serial_batch
+                     if mac in self.states and self.states[mac] in ready]
+            seen = {s.mac for s in batch}
+            candidates = sorted((s for s in ready if s.mac not in seen
+                                 and s.mac in self._serial_candidates), key=self._queue_sort_key)
+            seen.update(s.mac for s in candidates)
+            ready = batch + candidates + sorted((s for s in ready if s.mac not in seen),
+                                                key=self._queue_sort_key)
+        else:
+            ready.sort(key=self._queue_sort_key)
+        delayed.sort(key=lambda s: (s.retry_at, *self._queue_sort_key(s)))
+        return [s.mac for s in ready + delayed]
 
     async def pause_device(self, mac: str) -> None:
         mac = normalize_mac(mac)
@@ -631,6 +644,7 @@ class Scheduler:
         return {
             "status": state.status,
             "manual_paused": state.manual_paused,
+            "handle": state.handle,
             "is_focus": state.mac == self.focus_mac,
             "connected_seconds": round(now - state.connected_at, 1) if state.connected_at else None,
             "last_seen_seconds_ago": round(now - state.last_seen, 1) if state.last_seen else None,
@@ -647,6 +661,7 @@ class Scheduler:
         diagnostics = self.gateway.diagnostics()
         fault = diagnostics.get("first_fault")
         return {
+            "queue_order": self.queue_order(),
             "gateway": {
                 "name": self.gateway.name,
                 "driver": self.settings.gateway_driver,

@@ -175,7 +175,7 @@ def test_frozen_batch_survives_slow_connection_and_never_scans_over_links(phase_
     assert [c for c in s.gateway.calls if c[0] == 'scan'] == [('scan',)]
 
 
-def test_dwell_releases_one_link_and_fills_the_freed_slot(phase_scheduler):
+def test_dwell_finishes_batch_before_next_discovery(phase_scheduler):
     s, clock = phase_scheduler
     for i, mac in enumerate(MACS[:2]):
         event(s, 'connected', mac, i)
@@ -192,10 +192,15 @@ def test_dwell_releases_one_link_and_fills_the_freed_slot(phase_scheduler):
     event(s, 'disconnected', MACS[0])
     clock[0] += 2
     s._fill_connections()
+    assert s.gateway.calls[-1] == ('disconnect', MACS[1])
+    event(s, 'disconnected', MACS[1])
+    clock[0] += 2
+    discover(s, clock, MACS)
+    s._fill_connections()
     assert s.gateway.calls[-1] == ('connect', MACS[2])
 
 
-def test_four_devices_rotate_with_three_links_without_clearing_peers(phase_scheduler):
+def test_four_devices_rotate_by_batch_and_do_not_reconnect_completed_peer(phase_scheduler):
     s, clock = phase_scheduler
     fourth = '02A000000004'
     s.settings.max_connections = 4
@@ -213,11 +218,41 @@ def test_four_devices_rotate_with_three_links_without_clearing_peers(phase_sched
         sample(s, mac)
     s._fill_connections()
     assert s.gateway.calls == [('disconnect', MACS[0])]
-    event(s, 'disconnected', MACS[0])
-    clock[0] += 2
+    for index, mac in enumerate(MACS):
+        event(s, 'disconnected', mac)
+        clock[0] += 2
+        if index < 2:
+            s._fill_connections()
+            assert s.gateway.calls[-1] == ('disconnect', MACS[index + 1])
+    discover(s, clock, [*MACS, fourth])
     s._fill_connections()
     assert s.gateway.calls[-1] == ('connect', fourth)
-    assert set(s.gateway.active_links) == set(MACS[1:])
+    assert not s.gateway.active_links
+
+
+def test_many_device_queue_puts_completed_batch_behind_unserved_devices(phase_scheduler):
+    s, clock = phase_scheduler
+    macs = [f'02A00000{i:04X}' for i in range(18)]
+    s.states = {mac: DeviceRuntime(mac) for mac in macs}
+    s._device_configs = {mac: {'mac': mac} for mac in macs}
+    s.settings.max_connections = 3
+    for handle, mac in enumerate(macs[:3]):
+        event(s, 'connected', mac, handle)
+    clock[0] += s.settings.dwell_seconds + 1
+    for mac in macs[:3]:
+        sample(s, mac)
+    s._fill_connections()
+    for index, mac in enumerate(macs[:3]):
+        assert s.gateway.calls[-1] == ('disconnect', mac)
+        event(s, 'disconnected', mac)
+        clock[0] += 2
+        if index < 2:
+            s._fill_connections()
+    assert s.queue_order() == macs[3:] + macs[:3]
+    discover(s, clock, macs)
+    assert s._serial_batch[:3] == macs[3:6]
+    s._fill_connections()
+    assert s.gateway.calls[-1] == ('connect', macs[3])
 
 
 def test_unseen_focus_releases_current_link_to_rediscover(phase_scheduler):
