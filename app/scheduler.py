@@ -81,6 +81,11 @@ class Scheduler:
         self._serial_draining = False
         self._serial_refresh_at = 0.0
         self._serial_focus_pending = False
+        self._serial_safe_limit = 7
+        self._serial_recovery_reason: str | None = None
+        self._gateway_retry_at = 0.0
+        self._gateway_retry_attempts = 0
+        self._gateway_restarts = 0
 
     def _eligible_devices(self) -> list[dict[str, Any]]:
         include_simulated = self.settings.gateway_driver == "simulator"
@@ -117,9 +122,10 @@ class Scheduler:
                 pass
         self.gateway.stop()
 
-    async def restart_gateway(self) -> None:
+    async def restart_gateway(self, *, automatic: bool = False) -> None:
         """Apply gateway driver/port changes without restarting the web application."""
-        self.gateway.stop()
+        previous = self.gateway
+        previous.stop()
         self.decoder = WtvbStreamDecoder()
         self._connect_ready_at = 0.0
         self._serial_batch.clear()
@@ -127,6 +133,11 @@ class Scheduler:
         self._serial_draining = False
         self._serial_refresh_at = 0.0
         self._serial_focus_pending = bool(self.focus_mac)
+        if not automatic:
+            self._serial_safe_limit = 7
+            self._serial_recovery_reason = None
+            self._gateway_retry_at = 0.0
+            self._gateway_retry_attempts = 0
         now = time.monotonic()
         for state in self.states.values():
             state.status = "paused" if state.manual_paused else "queued"
@@ -143,6 +154,10 @@ class Scheduler:
             state.data_stable_since = None
             state.alarm = {"level": "normal", "reasons": []}
         self.gateway = self._make_gateway()
+        if automatic and isinstance(previous, SerialGateway) and isinstance(self.gateway, SerialGateway):
+            self.gateway._validated_profile = previous._validated_profile.copy()
+            self.gateway._preferred_profile = previous._validated_profile.copy()
+            self.gateway._profile_cursor = previous._profile_cursor.copy()
         self.gateway_error = None
         try:
             self.gateway.start()
@@ -151,12 +166,34 @@ class Scheduler:
             logger.exception("Gateway restart failed")
         await self.publish({"type": "snapshot", "snapshot": self.snapshot()})
 
+    async def _recover_serial_port(self) -> bool:
+        """Retry USB/serial I/O failures while keeping manual pauses and queue history."""
+        if self.settings.gateway_driver != "serial" or not getattr(self.gateway, "io_failed", False):
+            return False
+        now = time.monotonic()
+        if not self._gateway_retry_at:
+            self._gateway_retry_at = now + min(5 * 2 ** min(self._gateway_retry_attempts, 4), 60)
+        if now < self._gateway_retry_at:
+            return True
+        self._gateway_retry_attempts += 1
+        self._gateway_restarts += 1
+        logger.warning("Reopen serial gateway attempt=%s port=%s", self._gateway_retry_attempts, self.settings.serial_port)
+        await self.restart_gateway(automatic=True)
+        self._gateway_retry_at = (
+            time.monotonic() + min(5 * 2 ** min(self._gateway_retry_attempts, 4), 60)
+            if getattr(self.gateway, "io_failed", False) else 0.0
+        )
+        return True
+
     async def _loop(self) -> None:
         while self._running:
             try:
                 self._sync_devices()
                 for event in self.gateway.poll():
                     await self._handle_event(event)
+                if await self._recover_serial_port():
+                    await asyncio.sleep(0.1)
+                    continue
                 await self._adopt_registered_links()
                 self._expire_focus()
                 self._check_timeouts()
@@ -210,6 +247,16 @@ class Scheduler:
                 self.decoder = WtvbStreamDecoder()
             return
         if event.kind == "error":
+            message = event.message or ""
+            if self.settings.gateway_driver == "serial" and any(code in message for code in (
+                    "SERIAL_COLLISION_SUSPECTED", "AT_RESPONSE_TIMEOUT")):
+                self._serial_draining = True
+                self._serial_batch.clear()
+                self._serial_candidates.clear()
+                if "SERIAL_COLLISION_SUSPECTED" in message:
+                    self._serial_safe_limit = max(1, self._connection_limit() - 1)
+                    self._serial_recovery_reason = f"检测到串口控制指令干扰，本次运行已降为最多 {self._connection_limit()} 台同时采集"
+                logger.warning("Restart serial batch after transport failure: %s", message)
             if event.mac:
                 state = self.states.get(event.mac)
                 if not state:
@@ -292,6 +339,11 @@ class Scheduler:
             state.data_stable_since = now
         state.last_sample_at = now
         state.verified = True
+        if isinstance(self.gateway, SerialGateway):
+            self.gateway.report_data(sample.mac)
+            if not self.gateway.io_failed and not self.gateway._faulted:
+                self._gateway_retry_attempts = 0
+                self.gateway_error = None
         state.failures = 0
         state.latest = sample.as_dict()
         thresholds = self._device_configs.get(sample.mac, {}).get("thresholds", {})
@@ -336,10 +388,15 @@ class Scheduler:
 
     def _prepare_no_data_retry(self, state: DeviceRuntime, now: float) -> None:
         state.failures += 1
-        state.recovery_reason = "已连接但未收到有效数据，已隔离该连接并等待重试"
+        state.recovery_reason = (
+            "采集数据中断，保留已验证的连接方式并等待重新扫描"
+            if state.verified else "已连接但未收到有效数据，已隔离该连接并等待重试"
+        )
         state.error = state.recovery_reason
         state.retry_at = now + min(30 * 2 ** min(state.failures - 1, 3), 240)
         self.gateway.report_no_data(state.mac)
+        self._serial_batch = [mac for mac in self._serial_batch if mac != state.mac]
+        self._serial_candidates.discard(state.mac)
         logger.warning("No valid data mac=%s retry_in=%.0fs", state.mac, state.retry_at - now)
 
     def _rotate_completed(self) -> None:
@@ -544,7 +601,7 @@ class Scheduler:
 
     def _connection_limit(self) -> int:
         if self.settings.gateway_driver == "serial":
-            return min(self.settings.max_connections, self.settings.serial_concurrency_limit)
+            return min(self.settings.max_connections, self.settings.serial_concurrency_limit, self._serial_safe_limit)
         return self.settings.max_connections
 
     def _queue_sort_key(self, state: DeviceRuntime) -> tuple:
@@ -670,6 +727,12 @@ class Scheduler:
                 "connected": sum(state.status == "connected" for state in self.states.values()),
                 "maximum": self._connection_limit(),
                 "requested_maximum": self.settings.max_connections,
+                "adaptive_warning": self._serial_recovery_reason if self.settings.gateway_driver == "serial" else None,
+                "automatic_reconnect_attempts": self._gateway_restarts,
+                "automatic_reconnect_seconds": (
+                    round(max(0, self._gateway_retry_at - time.monotonic()), 1)
+                    if getattr(self.gateway, "io_failed", False) else None
+                ),
             },
             "focus_mac": self.focus_mac,
             "devices": {mac: self.status_dict(mac) for mac in self.states},

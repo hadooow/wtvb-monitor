@@ -31,6 +31,7 @@ const maxAxis = (sample, prefix) => sample ? Math.max(...["x", "y", "z"].map(axi
 
 function errorText(value) {
   if (!value) return "";
+  if (value.includes("SERIAL_IO_ERROR")) return "串口读取或写入失败，正在自动重连网关";
   const profile = value.includes(" | ") ? ` · 已尝试${value.split(" | ").slice(1).join(" | ")}` : "";
   if (value.includes("CNN_BUSY")) return `网关正忙，已自动排队重试${profile}`;
   if (value.includes("SERIAL_COLLISION_SUSPECTED")) return "连接指令期间检测到串口干扰，正在同步网关连接状态";
@@ -70,10 +71,12 @@ function render() {
     : `${gateway.name} · ${gateway.driver === "simulator" ? "模拟模式" : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开 · 等待网关回复" : "串口已打开 · 已收到网关回复") : "串口未打开"}`;
   badge.classList.toggle("error", Boolean(gateway.error));
   const warning = $("#gatewayWarning");
-  warning.hidden = !gateway.warning_count;
-  warning.textContent = gateway.warning_count
-    ? `已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`
-    : "";
+  const warnings = [];
+  if (gateway.adaptive_warning) warnings.push(gateway.adaptive_warning);
+  if (gateway.io_failed) warnings.push(`串口自动重连等待约 ${Math.ceil(gateway.automatic_reconnect_seconds || 0)} 秒`);
+  if (gateway.warning_count) warnings.push(`已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`);
+  warning.hidden = !warnings.length;
+  warning.textContent = warnings.join("。 ");
   const connected = devices.filter(device => device.runtime.status === "connected").length;
   $("#connectedCount").textContent = connected;
   $("#connectionLimit").textContent = `/ ${gateway.maximum ?? settings.max_connections} 路连接`;
@@ -536,6 +539,7 @@ function connectSocket() {
     if (message.type === "snapshot") {
       state.focusMac = message.snapshot.focus_mac;
       if (state.dashboard) {
+        state.dashboard.gateway = message.snapshot.gateway;
         state.dashboard.queue_order = message.snapshot.queue_order || [];
         for (const device of state.dashboard.devices) {
           if (message.snapshot.devices[device.mac]) device.runtime = message.snapshot.devices[device.mac];

@@ -198,6 +198,8 @@ class SerialGateway:
         self._profile_cursor: dict[str, int] = {}
         self._preferred_profile: dict[str, int] = {}
         self._active_profile: dict[str, int] = {}
+        self._validated_profile: dict[str, int] = {}
+        self.io_failed = False
 
     @property
     def name(self) -> str:
@@ -222,6 +224,7 @@ class SerialGateway:
     def diagnostics(self) -> dict:
         return {
             "online": self.online,
+            "io_failed": self.io_failed,
             "busy": self.busy,
             "faulted": self._faulted,
             "desynced": self._desynced,
@@ -269,7 +272,11 @@ class SerialGateway:
     def start(self) -> None:
         if self._serial and self._serial.is_open:
             return
-        self._serial = serial.Serial(self.port_name, self.baudrate, timeout=0.2, write_timeout=1)
+        try:
+            self._serial = serial.Serial(self.port_name, self.baudrate, timeout=0.2, write_timeout=1)
+        except (serial.SerialException, OSError) as exc:
+            self._io_failure(exc)
+            raise
         self._running.set()
         self._reader = threading.Thread(target=self._read_loop, name="gateway-reader", daemon=True)
         self._reader.start()
@@ -319,10 +326,32 @@ class SerialGateway:
         self._commands.put((f"AT+DISCON=,{mac}", mac))
 
     def report_no_data(self, mac: str) -> None:
-        """A link without samples has not validated its compatibility profile."""
+        """Try alternatives only for profiles that have never produced samples."""
+        if mac in self._validated_profile:
+            self._preferred_profile[mac] = self._validated_profile[mac]
+            self._record("stale_data", f"{mac}; retaining validated profile={self._validated_profile[mac]}")
+            return
         index = self._preferred_profile.pop(mac, self._profile_cursor.get(mac, 0))
         self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
         self._record("no_data", f"{mac}; next_profile={self._profile_cursor[mac]}")
+
+    def report_data(self, mac: str) -> None:
+        """Remember a profile only after a complete sensor sample validates it."""
+        index = self._active_profile.get(mac, self._preferred_profile.get(mac))
+        if index is not None and self._validated_profile.get(mac) != index:
+            self._validated_profile[mac] = index
+            self._record("validated_profile", f"{mac}; profile={index}")
+
+    def _io_failure(self, exc: Exception) -> None:
+        if self.io_failed:
+            return
+        message = f"SERIAL_IO_ERROR: {exc}"
+        self.io_failed = True
+        self._set_fault(message)
+        self._running.clear()
+        with self._response:
+            self._response.notify_all()
+        self.events.put(GatewayEvent("error", message=message))
 
     def scan(self) -> None:
         if not self.busy and not self._connected and not self._scanning:
@@ -473,7 +502,9 @@ class SerialGateway:
                 invalid_connection_snapshot = True
                 self._desynced = True
                 self._record("transaction_fault", "AT_INVALID_CONNECTION_SNAPSHOT: incomplete or conflicting AT+CNNI= response")
-            if self._collision_detected:
+            if self._collision_detected and (terminal is None or result is None):
+                # A complete matching CONN result and terminator remain valid
+                # even if an unrelated notification was corrupted in transit.
                 terminal = None
                 self._desynced = True
                 self._record("transaction_fault", f"SERIAL_COLLISION_SUSPECTED: {command}")
@@ -622,10 +653,13 @@ class SerialGateway:
                 if self._desynced:
                     self._resync_connections()
             except Exception as exc:
-                message = str(exc)
-                self._set_fault(message)
                 logger.exception("Serial command failed")
-                self.events.put(GatewayEvent("error", message=message))
+                if isinstance(exc, (serial.SerialException, OSError)):
+                    self._io_failure(exc)
+                else:
+                    message = str(exc)
+                    self._set_fault(message)
+                    self.events.put(GatewayEvent("error", message=message))
             finally:
                 self._busy = False
                 self._commands.task_done()
@@ -645,8 +679,15 @@ class SerialGateway:
             # profile. Only a failed connection attempt should rotate it.
             index = self._active_profile.pop(mac, None)
             if index is not None:
-                self._preferred_profile.pop(mac, None)
-                if "CNN_BUSY" not in (event.message or ""):
+                message = event.message or ""
+                transport_error = any(code in message for code in (
+                    "SERIAL_COLLISION_SUSPECTED", "AT_RESPONSE_TIMEOUT",
+                    "SCAN_STOP_FAILED", "AT_RESYNC_FAILED", "SERIAL_IO_ERROR",
+                ))
+                if mac in self._validated_profile:
+                    self._preferred_profile[mac] = self._validated_profile[mac]
+                elif not transport_error and "CNN_BUSY" not in message:
+                    self._preferred_profile.pop(mac, None)
                     self._profile_cursor[mac] = (index + 1) % len(self.CONNECTION_PROFILES)
                 event.message = f"{event.message or '连接失败'} | {self.CONNECTION_PROFILES[index][0]}"
         logger.info("Connection result mac=%s kind=%s message=%s", mac, event.kind, event.message)
@@ -767,12 +808,7 @@ class SerialGateway:
                     reported_partial = b""
             except Exception as exc:
                 logger.exception("Serial reader failed")
-                message = str(exc)
-                self.events.put(GatewayEvent("error", message=message))
-                self._set_fault(message)
-                self._running.clear()
-                with self._response:
-                    self._response.notify_all()
+                self._io_failure(exc)
 
 
 class SimulatorGateway:
