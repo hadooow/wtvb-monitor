@@ -84,6 +84,19 @@ def test_dashboard_exposes_upcoming_queue_order(api):
     }
 
 
+def test_disconnect_api_during_connection_waits_for_result(api, monkeypatch):
+    client, db, scheduler = api
+    device = db.get_device_by_mac('E8C5C0B8917E')
+    state = scheduler.states[device['mac']]
+    state.status = 'connecting'
+    calls = []
+    monkeypatch.setattr(scheduler.gateway, 'disconnect', calls.append)
+    response = client.post(f"/api/devices/{device['id']}/disconnect")
+    assert response.status_code == 200
+    assert state.manual_paused and state.status == 'connecting'
+    assert not state.disconnect_requested and calls == []
+
+
 def test_history_chart_limit_table_and_csv_export(api):
     client, db, _ = api
     device = db.get_device_by_mac('E8C5C0B8917E')

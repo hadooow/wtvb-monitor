@@ -74,6 +74,7 @@ function render() {
   const warnings = [];
   if (gateway.adaptive_warning) warnings.push(gateway.adaptive_warning);
   if (gateway.io_failed) warnings.push(`串口自动重连等待约 ${Math.ceil(gateway.automatic_reconnect_seconds || 0)} 秒`);
+  if (gateway.scan_start_failures && !gateway.faulted) warnings.push(`网关暂时拒绝启动扫描（第 ${gateway.scan_start_failures} 次），正在同步连接状态，稍后重试`);
   if (gateway.warning_count) warnings.push(`已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`);
   warning.hidden = !warnings.length;
   warning.textContent = warnings.join("。 ");

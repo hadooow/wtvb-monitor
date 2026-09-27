@@ -133,6 +133,9 @@ class SerialGateway:
     COMMAND_TIMEOUT_SECONDS = 5.0
     IDEMPOTENT_RETRIES = 2
     DISCONNECT_TIMEOUT_SECONDS = 15.0
+    CONNECT_RESPONSE_GRACE_SECONDS = 20.0
+    SCAN_START_MAX_FAILURES = 3
+    SCAN_RETRY_BASE_SECONDS = 1.0
     TX_IDLE_SECONDS = 0.02
     CONNECTION_PROFILES = (
         # Verified by static inspection of the user's working v0.4 EXE.
@@ -177,6 +180,8 @@ class SerialGateway:
         self.last_collision_at: str | None = None
         self._first_blocking_error: str | None = None
         self._scanning: bool | None = None
+        self._scan_start_failures = 0
+        self._scan_retry_at = 0.0
         self.scan_started_at: float | None = None
         self.first_fault: dict | None = None
         self.warning_count = 0
@@ -230,6 +235,8 @@ class SerialGateway:
             "desynced": self._desynced,
             "resync_failures": self._resync_failures,
             "scanning": self._scanning,
+            "scan_start_failures": self._scan_start_failures,
+            "scan_retry_seconds": round(max(0.0, self._scan_retry_at - time.monotonic()), 1),
             "active_connections": len(self._connected),
             "first_blocking_error": self._first_blocking_error,
             "first_fault": self.first_fault,
@@ -354,6 +361,8 @@ class SerialGateway:
         self.events.put(GatewayEvent("error", message=message))
 
     def scan(self) -> None:
+        if time.monotonic() < self._scan_retry_at:
+            return
         if not self.busy and not self._connected and not self._scanning:
             self.send("AT+SCAN=1")
 
@@ -373,7 +382,10 @@ class SerialGateway:
     def _execute(self, command: str, mac: str | None) -> GatewayEvent | None:
         """Only one AT transaction can own the reply stream."""
         invalid_connection_snapshot = False
-        timeout = self.connect_timeout_seconds + 5 if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
+        timeout = (
+            self.connect_timeout_seconds + self.CONNECT_RESPONSE_GRACE_SECONDS
+            if command.startswith("AT+CONN=") else self.COMMAND_TIMEOUT_SECONDS
+        )
         if command.startswith("AT+DISCON="):
             timeout = self.DISCONNECT_TIMEOUT_SECONDS
         with self._response:
@@ -540,6 +552,8 @@ class SerialGateway:
                 self._scanning = False
             elif command == "AT+SCAN=1":
                 self._scanning = True
+                self._scan_start_failures = 0
+                self._scan_retry_at = 0.0
             elif command == "AT+SCAN?":
                 self._scanning = self._scan_query_state
         if mac:
@@ -554,6 +568,28 @@ class SerialGateway:
         if terminal == "ERROR":
             message = f"AT_ERROR: {command}"
             logger.error("Command rejected: %s", command)
+            if command == "AT+SCAN=1":
+                self._scan_start_failures += 1
+                self._scanning = False
+                self.scan_started_at = None
+                if self._scan_start_failures < self.SCAN_START_MAX_FAILURES:
+                    retry_in = self.SCAN_RETRY_BASE_SECONDS * self._scan_start_failures
+                    self._desynced = True
+                    self._scan_retry_at = time.monotonic() + retry_in
+                    recovery = (
+                        f"SCAN_START_REJECTED attempt={self._scan_start_failures} "
+                        f"active={len(self._connected)} resync=true retry_in={retry_in:.1f}s"
+                    )
+                    self._record("scan_rejected", recovery)
+                    logger.warning(recovery)
+                    self.events.put(GatewayEvent(
+                        "warning", message="网关暂时拒绝启动扫描，正在同步连接状态，稍后重试",
+                    ))
+                    return None
+                message += (
+                    f"; 网关连续 {self._scan_start_failures} 次拒绝启动扫描，"
+                    "请通过厂商工具人工软复位网关，无效时断电重启，再导出诊断日志"
+                )
             self.events.put(GatewayEvent("error", message=message))
             if command in {"AT+SCAN=0", "AT+SCAN=1", "AT+SCAN?"}:
                 self._set_fault(message)
@@ -628,6 +664,23 @@ class SerialGateway:
                 continue
             self._busy = True
             try:
+                if self._desynced and not self._resync_connections():
+                    continue
+                if mac and command.startswith("AT+DISCON="):
+                    # An empty local map alone is not proof. Only a complete
+                    # CNNI transaction can make an absent target authoritative;
+                    # _execute invalidates that evidence before the next write.
+                    if self._connection_snapshot_complete and mac not in self._connected:
+                        message = f"DROP_STALE_DISCONNECT mac={mac} reason=authoritative_snapshot_absent"
+                        logger.info(message)
+                        self._record("stale_disconnect", message)
+                        self._finish_connection(GatewayEvent(
+                            "disconnected", mac,
+                            message="连接状态同步已确认目标不在线；跳过过期断开指令",
+                        ))
+                        continue
+                if command == "AT+SCAN=1" and time.monotonic() < self._scan_retry_at:
+                    continue
                 if command == "AT+SCAN=1" and self._connected:
                     logger.info(
                         "Skip scan start while BLE notifications are active connections=%s",
