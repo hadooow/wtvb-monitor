@@ -1,6 +1,8 @@
 import threading
 import time
 
+import pytest
+
 from app.gateway import LineBuffer, SerialGateway, parse_gateway_line
 
 
@@ -74,6 +76,96 @@ def test_profiles_start_with_verified_v04_command():
     assert commands[2] == f'AT+CONN={mac},0,3,247,40000,1,40,20,0,600'
     assert commands[3] == f'AT+CONN={mac},,,247,40000,1,40,20,0,600,1,1,0'
     assert all(',247,40000,' in command for command in commands)
+
+
+def test_connection_accepts_reply_after_45_seconds_with_40_second_device_timeout(monkeypatch):
+    gateway = SerialGateway('COM3', 115200, connect_timeout_seconds=40)
+    gateway._running.set()
+    gateway._serial = FakeSerial()
+    clock = [0.0]
+    monkeypatch.setattr('app.gateway.time.monotonic', lambda: clock[0])
+    def respond_late(delay):
+        gateway._receive_line('+CONN:2,0,FE6DF407B3E4,3,247')
+        gateway._receive_line('OK')
+    monkeypatch.setattr(gateway._response, 'wait', respond_late)
+    gateway._serial.callback = lambda _: clock.__setitem__(0, 53.0)
+    # The deadline is created after write returns. Set the first deadline read
+    # to the send time, then expose the late response time to the wait loop.
+    ticks = iter([0.0, 0.0])
+    monkeypatch.setattr('app.gateway.time.monotonic', lambda: next(ticks, clock[0]))
+    result = gateway._execute('AT+CONN=FE6DF407B3E4,,,247,40000,1,40,20,0,600', 'FE6DF407B3E4')
+    assert result.kind == 'connected'
+    assert ',40000,' in gateway._serial.writes[0]
+    assert not gateway._desynced
+
+
+def test_complete_empty_snapshot_drops_multiple_stale_disconnects(caplog):
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = .01
+    gateway._running.set()
+    gateway._serial = FakeSerial(lambda _: gateway._receive_line('+CNB:0'))
+    gateway.send('AT+CNNI=')
+    for mac in ('FE6DF407B3E4', 'E95BEA0C2DE1'):
+        gateway.disconnect(mac)
+    with caplog.at_level('INFO', logger='app.gateway'):
+        run_commands(gateway)
+    assert gateway._serial.writes == ['AT+CNNI=']
+    assert len([e for e in gateway.poll() if e.kind == 'disconnected']) == 2
+    assert caplog.text.count('DROP_STALE_DISCONNECT') == 2
+    assert not gateway._faulted
+
+
+@pytest.mark.parametrize('complete,links', [
+    (False, {}),
+    (True, {'FE6DF407B3E4': 0}),
+])
+def test_disconnect_requires_authoritative_absence_to_skip(complete, links):
+    mac = 'FE6DF407B3E4'
+    gateway = SerialGateway('COM3', 115200)
+    gateway._running.set()
+    gateway._connection_snapshot_complete = complete
+    gateway._connected.update(links)
+    def respond(_):
+        gateway._receive_line(f'+DISCON:2,0,{mac},22')
+        gateway._receive_line('OK')
+    gateway._serial = FakeSerial(respond)
+    gateway.disconnect(mac)
+    run_commands(gateway)
+    assert gateway._serial.writes == [f'AT+DISCON=,{mac}']
+
+
+def test_new_transaction_invalidates_old_empty_snapshot():
+    mac = 'FE6DF407B3E4'
+    gateway = SerialGateway('COM3', 115200)
+    gateway.COMMAND_TIMEOUT_SECONDS = .01
+    gateway._running.set()
+    def respond(command):
+        if command == 'AT+CNNI=':
+            gateway._receive_line('+CNB:0')
+        elif command == 'AT+OP?':
+            gateway._receive_line('+OP:V1.5,EW-DTU02-M,000000000000')
+            gateway._receive_line('OK')
+        else:
+            gateway._receive_line(f'+DISCON:2,0,{mac},22')
+            gateway._receive_line('OK')
+    gateway._serial = FakeSerial(respond)
+    gateway.send('AT+CNNI=')
+    gateway.send('AT+OP?')
+    gateway.disconnect(mac)
+    run_commands(gateway)
+    assert gateway._serial.writes == ['AT+CNNI=', 'AT+OP?', f'AT+DISCON=,{mac}']
+
+
+def test_failed_resync_never_claims_target_disconnected():
+    gateway = SerialGateway('COM3', 115200)
+    gateway._running.set()
+    gateway._desynced = True
+    gateway._serial = FakeSerial(lambda _: gateway._receive_line('ERROR'))
+    gateway.disconnect('FE6DF407B3E4')
+    run_commands(gateway)
+    assert gateway._serial.writes == ['AT+CNNI='] * 3
+    assert gateway._faulted
+    assert not any(e.kind == 'disconnected' for e in gateway.poll())
 
 
 def test_fragmented_serial_reads_preserve_multiple_messages():

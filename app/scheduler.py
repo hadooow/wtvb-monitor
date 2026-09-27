@@ -644,7 +644,12 @@ class Scheduler:
             # rotation; avoid sending a duplicate AT+DISCON transaction.
             state.disconnect_requested = True
             state.status = "disconnecting"
-        elif state.status in {"connected", "connecting"} or mac in getattr(self.gateway, "active_links", {}):
+        elif state.status == "connecting" and mac not in getattr(self.gateway, "active_links", {}):
+            # Keep the current connection transaction alive. Its success event
+            # will honor manual_paused and enqueue one real disconnect.
+            state.disconnect_requested = False
+            state.error = "已请求暂停，等待当前连接事务结束"
+        elif state.status == "connected" or mac in getattr(self.gateway, "active_links", {}):
             if not state.disconnect_requested:
                 state.disconnect_requested = True
                 self.gateway.disconnect(mac)
@@ -659,8 +664,11 @@ class Scheduler:
         if state is None:
             raise ValueError("设备未启用，无法重新连接")
         state.manual_paused = False
-        state.disconnect_requested = False
-        state.status = "queued"
+        # Resuming an intent must not create a second connection transaction
+        # while the original CONN or DISCON still owns the gateway.
+        if state.status not in {"connecting", "disconnecting", "connected"}:
+            state.disconnect_requested = False
+            state.status = "queued"
         state.retry_at = time.monotonic()
         state.error = None
         state.recovery_reason = None

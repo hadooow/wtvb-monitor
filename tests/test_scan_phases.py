@@ -32,12 +32,42 @@ def test_unconfirmed_scan_stop_never_sends_connection(reply):
     assert g.warning_count == 1
 
 
-def test_scan_start_rejection_is_blocking():
+def test_scan_start_rejection_resynchronizes_and_faults_only_at_limit():
+    g = SerialGateway('COM5', 115200)
+    g.COMMAND_TIMEOUT_SECONDS = .01
+    def respond(command):
+        g._receive_line('+CNB:0' if command == 'AT+CNNI=' else 'ERROR')
+    g._serial = FakeSerial(respond)
+    for attempt in range(1, 4):
+        g._serial.is_open = True
+        g._running.set()
+        g._scan_retry_at = 0
+        g.scan()
+        run_commands(g)
+        assert g._scan_start_failures == attempt
+        assert g._faulted == (attempt == 3)
+        assert g.scanning is not True
+        if attempt < 3:
+            assert not g._desynced
+            assert g._serial.writes.count('AT+CNNI=') == attempt
+            assert not any(e.kind == 'error' for e in g.poll())
+            g.scan()  # Backoff suppresses a new request even after resync.
+            assert g._commands.empty()
+    assert g._serial.writes == ['AT+SCAN=1', 'AT+CNNI='] * 2 + ['AT+SCAN=1']
+    assert '连续 3 次' in g.first_fault['message']
+
+
+def test_successful_scan_clears_rejection_budget():
     g = SerialGateway('COM5', 115200)
     g._running.set()
     g._serial = FakeSerial(lambda _: g._receive_line('ERROR'))
     g._execute('AT+SCAN=1', None)
-    assert g._faulted and g.scanning is not True
+    assert g._scan_start_failures == 1 and not g.first_fault
+    g._serial.callback = lambda _: g._receive_line('OK')
+    g._execute('AT+SCAN=1', None)
+    assert g.scanning is True
+    assert g._scan_start_failures == 0 and g._scan_retry_at == 0
+    assert not g._faulted
 
 
 def test_notify_and_unrelated_disconnect_ok_do_not_ack_scan_stop():
@@ -95,6 +125,7 @@ def test_serial_read_fault_survives_later_notification_warning():
 
 
 class PhaseGateway:
+    name = '测试网关'
     busy = False
     scanning = False
     scan_started_at = None
@@ -117,6 +148,8 @@ class PhaseGateway:
         self.calls.append(("no_data", mac))
     def disconnect(self, mac):
         self.calls.append(('disconnect', mac))
+    def diagnostics(self):
+        return {'online': True, 'active_connections': len(self.active_links)}
 
 
 @pytest.fixture
@@ -131,6 +164,120 @@ def phase_scheduler(tmp_path, monkeypatch):
     s.states = {mac: DeviceRuntime(mac) for mac in MACS}
     s._device_configs = {mac: {'mac': mac} for mac in MACS}
     return s, clock
+
+
+def test_pause_while_connecting_only_records_intent(phase_scheduler):
+    s, _ = phase_scheduler
+    state = s.states[MACS[0]]
+    state.status = 'connecting'
+    asyncio.run(s.pause_device(state.mac))
+    asyncio.run(s.pause_device(state.mac))
+    assert state.manual_paused and state.status == 'connecting'
+    assert not state.disconnect_requested and not s.gateway.calls
+    assert '等待当前连接事务结束' in state.error
+
+
+def test_pause_while_connecting_disconnects_once_on_late_success(phase_scheduler):
+    s, _ = phase_scheduler
+    state = s.states[MACS[0]]
+    state.status = 'connecting'
+    asyncio.run(s.pause_device(state.mac))
+    for _ in range(2):
+        asyncio.run(s._handle_event(GatewayEvent('connected', state.mac, handle=0)))
+    assert state.status == 'disconnecting' and state.disconnect_requested
+    assert s.gateway.calls == [('disconnect', state.mac)]
+
+
+def test_pause_while_connecting_failure_finishes_paused(phase_scheduler):
+    s, _ = phase_scheduler
+    state = s.states[MACS[0]]
+    state.status = 'connecting'
+    asyncio.run(s.pause_device(state.mac))
+    asyncio.run(s._handle_event(GatewayEvent(
+        'error', state.mac, message='AT_RESPONSE_TIMEOUT: AT+CONN=test',
+    )))
+    assert state.status == 'paused' and state.manual_paused
+    assert not state.disconnect_requested and not s.gateway.calls
+
+
+@pytest.mark.parametrize('status', ['connecting', 'disconnecting'])
+def test_resume_preserves_pending_transaction(phase_scheduler, status):
+    s, _ = phase_scheduler
+    state = s.states[MACS[0]]
+    state.status = status
+    state.manual_paused = True
+    state.disconnect_requested = status == 'disconnecting'
+    asyncio.run(s.resume_device(state.mac))
+    assert not state.manual_paused and state.status == status
+    s._fill_connections()
+    assert not s.gateway.calls
+    asyncio.run(s._handle_event(GatewayEvent(
+        'connected' if status == 'connecting' else 'disconnected', state.mac, handle=0,
+    )))
+    assert state.status == ('connected' if status == 'connecting' else 'queued')
+
+
+def test_pause_connecting_with_confirmed_link_disconnects(phase_scheduler):
+    s, _ = phase_scheduler
+    state = s.states[MACS[0]]
+    state.status = 'connecting'
+    s.gateway.active_links[state.mac] = 0
+    asyncio.run(s.pause_device(state.mac))
+    assert state.status == 'disconnecting'
+    assert s.gateway.calls == [('disconnect', state.mac)]
+
+
+def test_field_failure_sequence_drops_old_disconnects_and_restarts_scan(phase_scheduler, monkeypatch):
+    s, clock = phase_scheduler
+    first, second = MACS[:2]
+    event(s, 'connected', first)
+    g = SerialGateway('COM5', 115200)
+    g._connected[first] = 0
+    g._scanning = False
+    g.COMMAND_TIMEOUT_SECONDS = .01
+    g._running.set()
+    s.gateway = g
+    s.states[second].status = 'connecting'
+    s._serial_candidates = set(MACS)
+    s._serial_batch = [MACS[2]]
+    # Advance the transaction clock instead of waiting 60 physical seconds.
+    monkeypatch.setattr(g._response, 'wait', lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr('app.gateway.time.sleep', lambda delay: clock.__setitem__(0, clock[0] + delay))
+    def respond(command):
+        if command.startswith('AT+CONN='):
+            asyncio.run(s.pause_device(second))
+            assert g._commands.empty()  # No DISCON behind the ongoing CONN.
+            asyncio.run(s.pause_device(first))
+            # Simulate a legacy queued request as an additional worker guard.
+            g.disconnect(second)
+            g._receive_line(f'+DISCON:2,0,{first},8')
+            g._receive_line('OK')
+        elif command == 'AT+CNNI=':
+            g._receive_line('+CNB:0')
+        elif command == 'AT+SCAN=1':
+            g._receive_line('OK')
+            g._running.clear()
+        else:
+            pytest.fail(f'Unexpected serial write: {command}')
+    g._serial = FakeSerial(respond)
+    g.connect(second)
+    original_get = g._commands.get
+    def get_next(*args, **kwargs):
+        if g._commands.empty():
+            for incoming in g.poll():
+                asyncio.run(s._handle_event(incoming))
+            assert all(s.states[mac].status == 'paused' for mac in (first, second))
+            assert not g.active_links and not g._desynced
+            clock[0] += 3
+            s._fill_connections()
+            assert not g._commands.empty()
+        return original_get(*args, **kwargs)
+    monkeypatch.setattr(g._commands, 'get', get_next)
+    g._command_loop()
+    assert [c.split('=')[0] for c in g._serial.writes] == ['AT+CONN', 'AT+CNNI', 'AT+SCAN']
+    assert not any(c.startswith('AT+DISCON=') for c in g._serial.writes)
+    assert len([entry for entry in g.history if entry['kind'] == 'stale_disconnect']) == 2
+    assert g._commands.unfinished_tasks == 0 and not g._faulted
 
 
 def event(s, kind, mac, handle=0):
