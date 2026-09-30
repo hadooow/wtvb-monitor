@@ -59,10 +59,10 @@ class Settings:
     def validate(self) -> None:
         if self.sensor_frame_bytes not in {28, 32}:
             raise ValueError("sensor_frame_bytes must be 28 or 32")
-        if self.serial_connection_profile not in {-1, 0, 1, 2, 3}:
-            raise ValueError("serial_connection_profile must be -1 or 0..3")
-        if self.gateway_driver not in {"simulator", "serial"}:
-            raise ValueError("gateway_driver must be simulator or serial")
+        if self.serial_connection_profile not in {-1, 0, 1, 2, 3, 4}:
+            raise ValueError("serial_connection_profile must be -1 or 0..4")
+        if self.gateway_driver not in {"simulator", "serial", "ble"}:
+            raise ValueError("gateway_driver must be simulator, serial or ble")
         if not 1 <= int(self.max_connections) <= 7:
             raise ValueError("max_connections must be between 1 and 7")
         if not 1 <= int(self.serial_concurrency_limit) <= 7:

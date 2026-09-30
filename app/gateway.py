@@ -32,6 +32,27 @@ class GatewayEvent:
     service_count: int | None = None
 
 
+def advertisement_name(payload: str) -> str | None:
+    try:
+        data = bytes.fromhex(payload)
+    except ValueError:
+        return None
+    offset = 0
+    shortened = None
+    while offset < len(data):
+        length = data[offset]
+        if not length or offset + length >= len(data):
+            break
+        kind = data[offset + 1]
+        if kind in {8, 9}:
+            name = data[offset + 2:offset + length + 1].decode('utf-8', errors='replace')
+            if kind == 9:
+                return name
+            shortened = name
+        offset += length + 1
+    return shortened
+
+
 def parse_gateway_line(line: str) -> GatewayEvent | None:
     line = line.strip()
     if line.startswith("+SC_NTF:"):
@@ -44,6 +65,7 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
                     rssi=int(parts[4]),
                     addr_id=int(parts[1]),
                     addr_type=int(parts[2]),
+                    message=advertisement_name(parts[9]) or (advertisement_name(parts[11]) if len(parts) > 11 else None),
                 )
             except (ValueError, IndexError):
                 return None
@@ -147,10 +169,11 @@ class SerialGateway:
         ("普通连接/自动地址", 247, 0, False),
         ("普通连接/扫描地址", 247, 0, True),
         ("配对连接/自动地址", 247, 1, False),
+        ("普通连接/网关默认间隔", 247, 0, True),
     )
 
     def __init__(self, port: str, baudrate: int, connect_timeout_seconds: int = 40, *, connection_profile: int = -1) -> None:
-        if connection_profile not in {-1, 0, 1, 2, 3}:
+        if connection_profile not in {-1, 0, 1, 2, 3, 4}:
             raise ValueError("invalid connection profile")
         self.connection_profile = connection_profile
         self.port_name = port
@@ -334,7 +357,9 @@ class SerialGateway:
         address_fields = f"{address[0]},{address[1]}" if address else ","
         self._active_profile[mac] = index
         logger.info("CONNECT mac=%s profile=%s address=%s", mac, label, address)
-        command = f"AT+CONN={mac},{address_fields},{mtu},{timeout_ms},1,40,20,0,600"
+        command = f"AT+CONN={mac},{address_fields},{mtu},{timeout_ms},1"
+        if index != 4:
+            command += ",40,20,0,600"
         if security:
             command += ",1,1,0"
         # The worker owns the scan/collect phase transition. It confirms

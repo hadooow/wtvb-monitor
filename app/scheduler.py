@@ -39,6 +39,7 @@ class DeviceRuntime:
     early_notifications: deque = field(default_factory=lambda: deque(maxlen=32))
     mtu: int | None = None
     service_count: int | None = None
+    broadcast_name: str | None = None
     alarm: dict[str, Any] = field(default_factory=lambda: {"level": "normal", "reasons": []})
 
 
@@ -100,6 +101,9 @@ class Scheduler:
         return [device for device in self.database.list_devices(include_simulated) if device["enabled"]]
 
     def _make_gateway(self):
+        if self.settings.gateway_driver == "ble":
+            from .ble_gateway import BleGateway
+            return BleGateway(self.settings.connect_timeout_seconds)
         if self.settings.gateway_driver == "serial":
             return SerialGateway(
                 self.settings.serial_port,
@@ -130,11 +134,15 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
         self.gateway.stop()
+        if hasattr(self.gateway, "aclose"):
+            await self.gateway.aclose()
 
     async def restart_gateway(self, *, automatic: bool = False) -> None:
         """Apply gateway driver/port changes without restarting the web application."""
         previous = self.gateway
         previous.stop()
+        if hasattr(previous, "aclose"):
+            await previous.aclose()
         self.decoder = WtvbStreamDecoder(self.settings.sensor_frame_bytes)
         self._observed_connection_sequence = 0
         self._connection_recovery_until = 0.0
@@ -310,6 +318,8 @@ class Scheduler:
             state.last_seen = now
             state.last_discovered = now
             state.rssi = event.rssi
+            if event.message:
+                state.broadcast_name = event.message
         elif event.kind == "connected":
             if state.status == "connected" and state.handle == event.handle:
                 return  # A connection-list replay must not reset live samples.
@@ -339,7 +349,7 @@ class Scheduler:
                             await self._accept_sample(sample, received_at=received_at)
         elif event.kind == "disconnected":
             silent_link = (state.status == "connected" and state.last_sample_at is None)
-            if silent_link and self.settings.gateway_driver == "serial":
+            if silent_link and self.settings.gateway_driver in {"serial", "ble"}:
                 self._prepare_no_data_retry(state, now)
             self.decoder.forget(event.mac)
             state.early_notifications.clear()
@@ -358,7 +368,7 @@ class Scheduler:
         elif event.kind == "notify" and event.payload:
             if state.manual_paused:
                 return
-            if self.settings.gateway_driver == "serial":
+            if self.settings.gateway_driver in {"serial", "ble"}:
                 if state.status == "connecting":
                     state.early_notifications.append((event.handle, event.payload, now))
                     return
@@ -411,7 +421,7 @@ class Scheduler:
                 self.gateway.connection_finished_at + self.CONNECTION_RECOVERY_SECONDS
             )
         for state in self.states.values():
-            if (self.settings.gateway_driver == "serial" and state.status == "connected"
+            if (self.settings.gateway_driver in {"serial", "ble"} and state.status == "connected"
                     and state.connected_at is not None and not getattr(self.gateway, "busy", False)):
                 last_data = state.last_sample_at if state.last_sample_at is not None else state.connected_at
                 grace = self.STALE_SAMPLE_SECONDS if state.last_sample_at is not None else self.FIRST_SAMPLE_SECONDS
@@ -509,6 +519,8 @@ class Scheduler:
             and self._ready_to_connect(state, now)
         ]
         candidates.sort(key=lambda state: (state.last_cycle_at, state.failures))
+        if getattr(self.gateway, "busy", False):
+            return  # A BLE readiness check may have started discovery.
         if candidates:
             self._connect(candidates[0], now)
 
@@ -644,6 +656,11 @@ class Scheduler:
         self.gateway.connect(state.mac)
 
     def _ready_to_connect(self, state: DeviceRuntime, now: float) -> bool:
+        if self.settings.gateway_driver == "ble":
+            if not self.gateway.discovered(state.mac):
+                self.gateway.scan()
+                return False
+            return not self.gateway.busy
         if self.settings.gateway_driver != "serial":
             return True
         return state.mac in self._serial_batch and self.gateway.scanning is False
@@ -775,6 +792,7 @@ class Scheduler:
             "handle": state.handle,
             "mtu": state.mtu,
             "service_count": state.service_count,
+            "broadcast_name": state.broadcast_name,
             "is_focus": state.mac == self.focus_mac,
             "connected_seconds": round(now - state.connected_at, 1) if state.connected_at else None,
             "last_seen_seconds_ago": round(now - state.last_seen, 1) if state.last_seen else None,

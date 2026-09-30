@@ -31,6 +31,8 @@ const maxAxis = (sample, prefix) => sample ? Math.max(...["x", "y", "z"].map(axi
 
 function errorText(value) {
   if (!value) return "";
+  if (value.includes("BLE_SERVICE_MISMATCH")) return "电脑已连接，但未找到 FFE5/FFE4 数据服务，请下载诊断核对";
+  if (value.includes("BLE_CONNECT_FAILED")) return `电脑蓝牙连接失败 · ${value}`;
   if (value.includes("SERIAL_IO_ERROR")) return "串口读取或写入失败，正在自动重连网关";
   const profile = value.includes(" | ") ? ` · 已尝试${value.split(" | ").slice(1).join(" | ")}` : "";
   if (value.includes("CNN_BUSY")) return `网关正忙，已自动排队重试${profile}`;
@@ -68,10 +70,11 @@ function render() {
   const badge = $("#gatewayBadge");
   badge.textContent = gateway.error
     ? `网关异常 · ${errorText(gateway.error)}`
-    : `${gateway.name} · ${gateway.driver === "simulator" ? "模拟模式" : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开 · 等待网关回复" : "串口已打开 · 已收到网关回复") : "串口未打开"}`;
+    : `${gateway.name} · ${gateway.driver === "ble" ? (gateway.online ? (gateway.scanning ? "正在扫描" : "直连驱动运行中") : "直连驱动未启动") : gateway.driver === "simulator" ? "模拟模式" : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开 · 等待网关回复" : "串口已打开 · 已收到网关回复") : "串口未打开"}`;
   badge.classList.toggle("error", Boolean(gateway.error));
   const warning = $("#gatewayWarning");
   const warnings = [];
+  if (gateway.ble_scan_error) warnings.push(`电脑蓝牙扫描失败：${gateway.ble_scan_error}。请开启蓝牙并使用支持 BLE 的适配器`);
   if (gateway.adaptive_warning) warnings.push(gateway.adaptive_warning);
   if (gateway.data_recovery_seconds > 0) warnings.push(`连接操作刚结束，正在观察数据恢复（约 ${Math.ceil(gateway.data_recovery_seconds)} 秒）`);
   if (gateway.io_failed) warnings.push(`串口自动重连等待约 ${Math.ceil(gateway.automatic_reconnect_seconds || 0)} 秒`);
@@ -322,7 +325,7 @@ function renderDiagnostics(runtime) {
   const rssi = runtime.rssi;
   const weak = rssi !== null && rssi !== undefined && rssi < -75;
   panel.innerHTML = `
-    <div><span>485 / USB 网关</span><strong>${gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开，尚无回复" : `最近回复 ${gateway.last_response_seconds_ago} 秒前`) : "串口未打开"}</strong></div>
+    <div><span>${gateway.driver === "ble" ? "电脑蓝牙" : "485 / USB 网关"}</span><strong>${gateway.driver === "ble" ? (gateway.online ? "直连驱动运行中" : "直连驱动未启动") : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开，尚无回复" : `最近回复 ${gateway.last_response_seconds_ago} 秒前`) : "串口未打开"}</strong></div>
     <div class="${weak ? "weak" : ""}"><span>传感器广播</span><strong>${seen ? `已发现 · ${rssi ?? "—"} dBm${weak ? " · 信号弱" : ""}` : "尚未扫描到"}</strong></div>
     <div class="${runtime.error ? "failed" : ""}"><span>BLE 数据连接</span><strong>${runtime.status === "connected" ? (runtime.collecting ? "已连接并接收有效数据" : "已连接，等待有效数据") : runtime.status === "connecting" ? "正在建立连接" : escapeHtml(errorText(runtime.error)) || statusNames[runtime.status] || "等待连接"}</strong></div>
     <div><span>串口诊断</span><strong>乱码 ${gateway.non_ascii_bytes ?? 0} 字节 · 疑似碰撞 ${gateway.serial_collision_suspected ?? 0} 次</strong></div>`;

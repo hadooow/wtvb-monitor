@@ -30,6 +30,8 @@ def smoke_test(bundle: Path) -> None:
             port = sock.getsockname()[1]
         settings.update(gateway_driver='simulator', host='127.0.0.1', port=port, persist_interval_seconds=1)
         settings_path.write_text(json.dumps(settings), encoding='utf-8')
+        subprocess.run([str(test / 'WTVB-Monitor.exe'), '--verify-ble-runtime'],
+                       cwd=test, check=True, timeout=20)
         process = subprocess.Popen([str(test / 'WTVB-Monitor.exe')], cwd=test,
                                    env={**os.environ, 'WTVB_NO_BROWSER': '1'})
         try:
@@ -80,6 +82,7 @@ def main() -> None:
         sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
         '--name', 'WTVB-Monitor', '--add-data', f'{ROOT / "app" / "static"};app/static',
         '--collect-submodules', 'uvicorn', '--collect-submodules', 'websockets',
+        '--collect-all', 'bleak', '--collect-submodules', 'winrt',
         '--distpath', 'release', '--workpath', 'work/build', '--specpath', 'work/spec',
         'launcher.py',
     ], check=True)

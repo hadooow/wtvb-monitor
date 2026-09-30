@@ -44,8 +44,8 @@ class DeviceUpdate(BaseModel):
 
 class SettingsUpdate(BaseModel):
     sensor_frame_bytes: Literal[28, 32] | None = None
-    serial_connection_profile: Literal[-1, 0, 1, 2, 3] | None = None
-    gateway_driver: Literal["simulator", "serial"] | None = None
+    serial_connection_profile: Literal[-1, 0, 1, 2, 3, 4] | None = None
+    gateway_driver: Literal["simulator", "serial", "ble"] | None = None
     serial_port: str | None = Field(None, min_length=3, max_length=20)
     baudrate: int | None = Field(None, ge=1200, le=921600)
     connect_timeout_seconds: int | None = Field(None, ge=5, le=60)

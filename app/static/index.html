@@ -43,7 +43,8 @@
   <dialog id="settingsDialog">
     <form id="settingsForm">
       <div class="dialog-title"><h2>采集设置</h2><button type="button" data-close="settingsDialog" class="icon-button" aria-label="关闭">×</button></div>
-      <label>网关模式<select name="gateway_driver"><option value="simulator">模拟网关（测试用）</option><option value="serial">真实 EW-DTU02 网关</option></select></label>
+      <label>网关模式<select name="gateway_driver"><option value="simulator">模拟网关（测试用）</option><option value="serial">真实 EW-DTU02 网关</option><option value="ble">Windows 电脑蓝牙直连（新功能）</option></select></label>
+      <p class="hint">电脑直连需开启 Windows 蓝牙，先用一台传感器测试；使用 FFE5/FFE4 服务，不主动配对或改写传感器。串口连接方式只对 EW-DTU02 有效。</p>
       <label>真实网关串口<input name="serial_port" placeholder="COM3"></label>
       <label>串口波特率<input name="baudrate" type="number" min="1200" max="921600" required></label>
       <label>连接超时（秒，手册建议 40）<input name="connect_timeout_seconds" type="number" min="5" max="60" required></label>
@@ -53,7 +54,7 @@
       <label>数据库保存间隔（秒）<input name="persist_interval_seconds" type="number" min="1" max="60"></label>
       <label>网页刷新次数/秒<input name="web_refresh_hz" type="number" min="1" max="10"></label>
       <label>传感器数据格式<select name="sensor_frame_bytes"><option value="32">32 字节（默认，现场日志已验证）</option><option value="28">28 字节（仅用于已确认的旧固件）</option></select></label>
-      <label>连接方式<select name="serial_connection_profile"><option value="-1">自动兼容（默认）</option><option value="0">固定配对 / 扫描地址</option><option value="1">固定普通 / 自动地址</option><option value="2">固定普通 / 扫描地址</option><option value="3">固定配对 / 自动地址</option></select></label>
+      <label>连接方式<select name="serial_connection_profile"><option value="-1">自动兼容（默认）</option><option value="0">固定配对 / 扫描地址</option><option value="1">固定普通 / 自动地址</option><option value="2">固定普通 / 扫描地址</option><option value="4">普通连接／网关默认间隔（新增）</option><option value="3">固定配对 / 自动地址</option></select></label>
       <p class="hint">排查时可将连接数量设为 1，再固定一种方式对照测试；没有确认原因前请保留自动兼容。</p>
       <p class="hint">只有确认传感器回传 28 字节时才切换格式，保存后重新连接网关。</p>
       <p class="hint">切换网关模式会立即重新连接。使用真实网关前，请关闭厂商上位机，避免两个程序同时占用串口。</p>

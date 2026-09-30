@@ -176,6 +176,6 @@ def test_new_settings_round_trip_and_legacy_defaults(tmp_path):
     assert Settings.load(path).serial_connection_profile == 1
 
 
-@pytest.mark.parametrize('values', [{'sensor_frame_bytes': 20}, {'serial_connection_profile': 4}])
+@pytest.mark.parametrize('values', [{'sensor_frame_bytes': 20}, {'serial_connection_profile': 5}])
 def test_invalid_settings(values):
     with pytest.raises(ValueError): Settings().update(values)
