@@ -108,16 +108,16 @@ def evaluate_alarm(sample: SensorSample | dict[str, Any], thresholds: dict[str, 
 
 
 def parse_wtvb01_frame(mac: str, frame: bytes, source: str = "gateway") -> SensorSample | None:
-    """Parse the WTVB01-BT50 32-byte 0x55 0x61 notification frame."""
-    if len(frame) < 32 or frame[0:2] != b"\x55\x61":
+    """Parse the WTVB01-BT50 28/32-byte 0x55 0x61 notification frame."""
+    if len(frame) not in {28, 32} or frame[0:2] != b"\x55\x61":
         return None
     timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     return SensorSample(
         mac=normalize_mac(mac),
         timestamp=timestamp,
-        velocity_x=float(_i16(frame, 2)),
-        velocity_y=float(_i16(frame, 4)),
-        velocity_z=float(_i16(frame, 6)),
+        velocity_x=float(_u16(frame, 2)),
+        velocity_y=float(_u16(frame, 4)),
+        velocity_z=float(_u16(frame, 6)),
         vibration_angle_x=round(_i16(frame, 8) / 32768.0 * 180.0, 4),
         vibration_angle_y=round(_i16(frame, 10) / 32768.0 * 180.0, 4),
         vibration_angle_z=round(_i16(frame, 12) / 32768.0 * 180.0, 4),
@@ -137,7 +137,12 @@ class WtvbStreamDecoder:
 
     FRAME_LENGTHS = {0x61: 32, 0x71: 20}
 
-    def __init__(self) -> None:
+    def __init__(self, frame_bytes: int = 32) -> None:
+        if frame_bytes not in {28, 32}:
+            raise ValueError("frame_bytes must be 28 or 32")
+        # Explicit format avoids mistaking a 28+4 split of a 32-byte frame
+        # for a complete legacy frame. Keep the field-proven 32-byte default.
+        self.frame_bytes = frame_bytes
         self._buffers: dict[str, bytearray] = {}
 
     def forget(self, mac: str) -> None:
@@ -163,7 +168,7 @@ class WtvbStreamDecoder:
                 del buffer[:start]
             if len(buffer) < 2:
                 break
-            frame_length = self.FRAME_LENGTHS.get(buffer[1])
+            frame_length = self.frame_bytes if buffer[1] == 0x61 else self.FRAME_LENGTHS.get(buffer[1])
             if frame_length is None:
                 del buffer[0]
                 continue

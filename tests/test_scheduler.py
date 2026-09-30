@@ -22,6 +22,8 @@ def test_completed_sampling_window_is_preempted_first():
 
 def test_scan_does_not_add_unregistered_neighbour_device():
     scheduler = Scheduler.__new__(Scheduler)
+    from app.protocol import WtvbStreamDecoder
+    scheduler.decoder = WtvbStreamDecoder()
     scheduler.states = {"FE6DF407B3E4": DeviceRuntime("FE6DF407B3E4")}
     scheduler.gateway_error = None
     asyncio.run(scheduler._handle_event(GatewayEvent("scan", "CCB5D1682B71", rssi=-50)))
@@ -37,6 +39,8 @@ def test_only_one_connection_attempt_is_started_at_a_time():
             self.calls.append(mac)
 
     scheduler = Scheduler.__new__(Scheduler)
+    from app.protocol import WtvbStreamDecoder
+    scheduler.decoder = WtvbStreamDecoder()
     scheduler.settings = SimpleNamespace(max_connections=5, gateway_driver="simulator", dwell_seconds=180)
     scheduler.gateway = FakeGateway()
     scheduler.focus_mac = None

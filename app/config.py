@@ -33,6 +33,8 @@ class Settings:
     focus_lease_seconds: int = 30
     persist_interval_seconds: int = 5
     web_refresh_hz: int = 5
+    sensor_frame_bytes: int = 32
+    serial_connection_profile: int = -1
     host: str = "0.0.0.0"
     port: int = 8000
 
@@ -55,6 +57,10 @@ class Settings:
         self.validate()
 
     def validate(self) -> None:
+        if self.sensor_frame_bytes not in {28, 32}:
+            raise ValueError("sensor_frame_bytes must be 28 or 32")
+        if self.serial_connection_profile not in {-1, 0, 1, 2, 3}:
+            raise ValueError("serial_connection_profile must be -1 or 0..3")
         if self.gateway_driver not in {"simulator", "serial"}:
             raise ValueError("gateway_driver must be simulator or serial")
         if not 1 <= int(self.max_connections) <= 7:

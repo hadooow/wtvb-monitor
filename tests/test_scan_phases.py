@@ -291,7 +291,9 @@ def event(s, kind, mac, handle=0):
 
 
 def sample(s, mac):
-    asyncio.run(s._handle_event(parse_gateway_line(REPLAY['valid'].replace(MACS[0], mac))))
+    incoming = parse_gateway_line(REPLAY['valid'].replace(MACS[0], mac))
+    incoming.handle = s.states[mac].handle
+    asyncio.run(s._handle_event(incoming))
     # These phase fixtures represent an already established data stream.
     s.states[mac].data_stable_since = s.gateway.clock[0] - s.DATA_SETTLE_SECONDS
 
@@ -465,7 +467,7 @@ def test_repeated_focus_between_connected_devices_keeps_both_streams(phase_sched
         s.request_focus(mac)
         s._fill_connections()
         for peer in MACS[:2]:
-            asyncio.run(s._handle_event(parse_gateway_line(REPLAY['valid'].replace(MACS[0], peer))))
+            sample(s, peer)
             assert s.status_dict(peer)['collecting']
         assert s.focus_mac == mac
     assert not s.gateway.calls

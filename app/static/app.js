@@ -73,6 +73,7 @@ function render() {
   const warning = $("#gatewayWarning");
   const warnings = [];
   if (gateway.adaptive_warning) warnings.push(gateway.adaptive_warning);
+  if (gateway.data_recovery_seconds > 0) warnings.push(`连接操作刚结束，正在观察数据恢复（约 ${Math.ceil(gateway.data_recovery_seconds)} 秒）`);
   if (gateway.io_failed) warnings.push(`串口自动重连等待约 ${Math.ceil(gateway.automatic_reconnect_seconds || 0)} 秒`);
   if (gateway.scan_start_failures && !gateway.faulted) warnings.push(`网关暂时拒绝启动扫描（第 ${gateway.scan_start_failures} 次），正在同步连接状态，稍后重试`);
   if (gateway.warning_count) warnings.push(`已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`);
@@ -569,6 +570,8 @@ $("#settingsButton").addEventListener("click", () => {
   form.dwell_minutes.value = values.dwell_seconds / 60;
   form.persist_interval_seconds.value = values.persist_interval_seconds;
   form.web_refresh_hz.value = values.web_refresh_hz;
+  form.sensor_frame_bytes.value = values.sensor_frame_bytes ?? 32;
+  form.serial_connection_profile.value = values.serial_connection_profile ?? -1;
   $("#settingsDialog").showModal();
 });
 
@@ -586,6 +589,8 @@ $("#settingsForm").addEventListener("submit", async event => {
       dwell_seconds: Number(form.get("dwell_minutes")) * 60,
       persist_interval_seconds: Number(form.get("persist_interval_seconds")),
       web_refresh_hz: Number(form.get("web_refresh_hz")),
+      sensor_frame_bytes: Number(form.get("sensor_frame_bytes")),
+      serial_connection_profile: Number(form.get("serial_connection_profile")),
     }) });
     $("#settingsDialog").close();
     await loadDashboard();

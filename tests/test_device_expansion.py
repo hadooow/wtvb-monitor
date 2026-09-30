@@ -71,7 +71,7 @@ def test_connected_without_data_blocks_next_attempt_then_isolates_only_peer(phas
     assert s.states[MACS[0]].retry_at > clock[0]
 
 
-def test_silent_peer_retries_from_batch_without_draining_healthy_peer(phase_scheduler):
+def test_unseen_silent_peer_does_not_retry_or_drain_healthy_peer(phase_scheduler):
     s, clock = phase_scheduler
     event(s, 'connected', MACS[0])
     s._serial_candidates = set(MACS[:2])
@@ -86,7 +86,8 @@ def test_silent_peer_retries_from_batch_without_draining_healthy_peer(phase_sche
     clock[0] += 21
     sample(s, MACS[0])
     s._fill_connections()
-    assert s.gateway.calls == [('connect', MACS[1])]
+    assert s.gateway.calls == []
+    assert MACS[1] not in s._serial_candidates
 
 
 def test_long_batch_does_not_disconnect_just_connected_sensor(phase_scheduler):

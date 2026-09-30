@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -35,6 +36,9 @@ class DeviceRuntime:
     disconnect_requested: bool = False
     verified: bool = False
     data_stable_since: float | None = None
+    early_notifications: deque = field(default_factory=lambda: deque(maxlen=32))
+    mtu: int | None = None
+    service_count: int | None = None
     alarm: dict[str, Any] = field(default_factory=lambda: {"level": "normal", "reasons": []})
 
 
@@ -54,6 +58,8 @@ class Scheduler:
     FIRST_SAMPLE_SECONDS = 20.0
     STALE_SAMPLE_SECONDS = 20.0
     DATA_SETTLE_SECONDS = 5.0
+    DISCOVERY_FRESH_SECONDS = 60.0
+    CONNECTION_RECOVERY_SECONDS = 10.0
 
     def __init__(
         self,
@@ -64,7 +70,9 @@ class Scheduler:
         self.database = database
         self.settings = settings
         self.publish = publish
-        self.decoder = WtvbStreamDecoder()
+        self.decoder = WtvbStreamDecoder(settings.sensor_frame_bytes)
+        self._observed_connection_sequence = 0
+        self._connection_recovery_until = 0.0
         self.states: dict[str, DeviceRuntime] = {}
         self.focus_mac: str | None = None
         self.focus_until = 0.0
@@ -97,6 +105,7 @@ class Scheduler:
                 self.settings.serial_port,
                 self.settings.baudrate,
                 self.settings.connect_timeout_seconds,
+                connection_profile=self.settings.serial_connection_profile,
             )
         return SimulatorGateway(lambda: [device["mac"] for device in self._eligible_devices()])
 
@@ -126,7 +135,9 @@ class Scheduler:
         """Apply gateway driver/port changes without restarting the web application."""
         previous = self.gateway
         previous.stop()
-        self.decoder = WtvbStreamDecoder()
+        self.decoder = WtvbStreamDecoder(self.settings.sensor_frame_bytes)
+        self._observed_connection_sequence = 0
+        self._connection_recovery_until = 0.0
         self._connect_ready_at = 0.0
         self._serial_batch.clear()
         self._serial_candidates.clear()
@@ -152,6 +163,9 @@ class Scheduler:
             state.latest = None
             state.recovery_reason = None
             state.data_stable_since = None
+            state.early_notifications.clear()
+            state.mtu = None
+            state.service_count = None
             state.alarm = {"level": "normal", "reasons": []}
         self.gateway = self._make_gateway()
         if automatic and isinstance(previous, SerialGateway) and isinstance(self.gateway, SerialGateway):
@@ -244,7 +258,7 @@ class Scheduler:
             if event.mac:
                 self.decoder.forget(event.mac)
             else:
-                self.decoder = WtvbStreamDecoder()
+                self.decoder = WtvbStreamDecoder(self.settings.sensor_frame_bytes)
             return
         if event.kind == "error":
             message = event.message or ""
@@ -261,6 +275,11 @@ class Scheduler:
                 state = self.states.get(event.mac)
                 if not state:
                     return
+                state.early_notifications.clear()
+                self.decoder.forget(event.mac)
+                # A failed peer must be observed again before another attempt.
+                self._serial_candidates.discard(event.mac)
+                self._serial_batch = [mac for mac in self._serial_batch if mac != event.mac]
                 state.status = "paused" if state.manual_paused else "retrying"
                 state.failures += 1
                 state.error = event.message
@@ -297,22 +316,33 @@ class Scheduler:
             state.status = "disconnecting" if state.manual_paused else "connected"
             state.connected_at = now
             state.handle = event.handle
+            state.mtu = event.mtu
+            state.service_count = event.service_count
             state.error = None
             state.recovery_reason = None
             state.data_stable_since = None
             state.last_sample_at = None
             state.latest = None
+            self.decoder.forget(event.mac)
             self._connect_ready_at = now + 2.0
             # Long connection procedures must not consume the collection window.
             self._serial_refresh_at = now + max(self.settings.dwell_seconds, self.REDISCOVERY_SECONDS)
             if state.manual_paused and not state.disconnect_requested:
                 state.disconnect_requested = True
                 self.gateway.disconnect(state.mac)
+            buffered = list(state.early_notifications)
+            state.early_notifications.clear()
+            if not state.manual_paused:
+                for handle, payload, received_at in buffered:
+                    if handle == state.handle:
+                        for sample in self.decoder.feed(event.mac, payload, source=self.settings.gateway_driver):
+                            await self._accept_sample(sample, received_at=received_at)
         elif event.kind == "disconnected":
             silent_link = (state.status == "connected" and state.last_sample_at is None)
             if silent_link and self.settings.gateway_driver == "serial":
                 self._prepare_no_data_retry(state, now)
             self.decoder.forget(event.mac)
+            state.early_notifications.clear()
             state.last_sample_at = None
             state.error = state.recovery_reason or (None if state.manual_paused else event.message)
             state.status = (
@@ -326,12 +356,20 @@ class Scheduler:
             state.last_cycle_at = now
             self._connect_ready_at = now + 1.0
         elif event.kind == "notify" and event.payload:
+            if state.manual_paused:
+                return
+            if self.settings.gateway_driver == "serial":
+                if state.status == "connecting":
+                    state.early_notifications.append((event.handle, event.payload, now))
+                    return
+                if state.status != "connected" or event.handle != state.handle:
+                    return
             state.last_seen = now
             for sample in self.decoder.feed(event.mac, event.payload, source=self.settings.gateway_driver):
                 await self._accept_sample(sample)
 
-    async def _accept_sample(self, sample: SensorSample) -> None:
-        now = time.monotonic()
+    async def _accept_sample(self, sample: SensorSample, *, received_at: float | None = None) -> None:
+        now = time.monotonic() if received_at is None else received_at
         state = self.states[sample.mac]
         if state.last_sample_at is None:
             logger.info("First valid sensor sample mac=%s temperature=%s", sample.mac, sample.temperature)
@@ -366,11 +404,19 @@ class Scheduler:
 
     def _check_timeouts(self) -> None:
         now = time.monotonic()
+        sequence = getattr(self.gateway, "connection_finished_sequence", 0)
+        if sequence != self._observed_connection_sequence:
+            self._observed_connection_sequence = sequence
+            self._connection_recovery_until = (
+                self.gateway.connection_finished_at + self.CONNECTION_RECOVERY_SECONDS
+            )
         for state in self.states.values():
             if (self.settings.gateway_driver == "serial" and state.status == "connected"
                     and state.connected_at is not None and not getattr(self.gateway, "busy", False)):
                 last_data = state.last_sample_at if state.last_sample_at is not None else state.connected_at
                 grace = self.STALE_SAMPLE_SECONDS if state.last_sample_at is not None else self.FIRST_SAMPLE_SECONDS
+                if now < self._connection_recovery_until:
+                    continue
                 if now - last_data >= grace:
                     self._prepare_no_data_retry(state, now)
                     state.status = "disconnecting"
@@ -487,6 +533,11 @@ class Scheduler:
         active = [s for s in self.states.values() if s.status == "connected"]
         waiting = [s for s in self.states.values()
                    if not s.manual_paused and s.status in {"queued", "retrying"} and s.retry_at <= now]
+        # Scan identities belong to a recent discovery, not an unbounded batch.
+        fresh = {s.mac for s in self.states.values() if s.last_discovered is not None
+                 and now - s.last_discovered <= self.DISCOVERY_FRESH_SECONDS}
+        self._serial_candidates.intersection_update(fresh)
+        self._serial_batch = [mac for mac in self._serial_batch if mac in fresh]
         if len(active) > limit:
             victim = select_victim(active, self.focus_mac, now, 0)
             if victim:
@@ -583,6 +634,13 @@ class Scheduler:
         state.status = "connecting"
         state.connected_at = now
         state.error = None
+        state.early_notifications.clear()
+        self.decoder.forget(state.mac)
+        state.last_sample_at = None
+        state.latest = None
+        state.data_stable_since = None
+        state.mtu = None
+        state.service_count = None
         self.gateway.connect(state.mac)
 
     def _ready_to_connect(self, state: DeviceRuntime, now: float) -> bool:
@@ -637,6 +695,11 @@ class Scheduler:
             raise ValueError("设备未启用，无法在本次运行中暂停")
         state.manual_paused = True
         state.error = None
+        state.early_notifications.clear()
+        self.decoder.forget(state.mac)
+        state.last_sample_at = None
+        state.latest = None
+        state.data_stable_since = None
         if self.focus_mac == mac:
             self.clear_focus()
         if state.status == "disconnecting":
@@ -710,6 +773,8 @@ class Scheduler:
             "status": state.status,
             "manual_paused": state.manual_paused,
             "handle": state.handle,
+            "mtu": state.mtu,
+            "service_count": state.service_count,
             "is_focus": state.mac == self.focus_mac,
             "connected_seconds": round(now - state.connected_at, 1) if state.connected_at else None,
             "last_seen_seconds_ago": round(now - state.last_seen, 1) if state.last_seen else None,
@@ -736,6 +801,7 @@ class Scheduler:
                 "maximum": self._connection_limit(),
                 "requested_maximum": self.settings.max_connections,
                 "adaptive_warning": self._serial_recovery_reason if self.settings.gateway_driver == "serial" else None,
+                "data_recovery_seconds": round(max(0.0, self._connection_recovery_until - time.monotonic()), 1),
                 "automatic_reconnect_attempts": self._gateway_restarts,
                 "automatic_reconnect_seconds": (
                     round(max(0, self._gateway_retry_at - time.monotonic()), 1)

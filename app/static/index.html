@@ -52,6 +52,10 @@
       <label>单次采集时长（分钟）<input name="dwell_minutes" type="number" min="1" max="5"></label>
       <label>数据库保存间隔（秒）<input name="persist_interval_seconds" type="number" min="1" max="60"></label>
       <label>网页刷新次数/秒<input name="web_refresh_hz" type="number" min="1" max="10"></label>
+      <label>传感器数据格式<select name="sensor_frame_bytes"><option value="32">32 字节（默认，现场日志已验证）</option><option value="28">28 字节（仅用于已确认的旧固件）</option></select></label>
+      <label>连接方式<select name="serial_connection_profile"><option value="-1">自动兼容（默认）</option><option value="0">固定配对 / 扫描地址</option><option value="1">固定普通 / 自动地址</option><option value="2">固定普通 / 扫描地址</option><option value="3">固定配对 / 自动地址</option></select></label>
+      <p class="hint">排查时可将连接数量设为 1，再固定一种方式对照测试；没有确认原因前请保留自动兼容。</p>
+      <p class="hint">只有确认传感器回传 28 字节时才切换格式，保存后重新连接网关。</p>
       <p class="hint">切换网关模式会立即重新连接。使用真实网关前，请关闭厂商上位机，避免两个程序同时占用串口。</p>
       <p class="hint">真实 EW-DTU02 + 115200 RS485 默认最多同时连接 3 台；更多已登记设备将在采集轮换中逐台切换。除非已验证网关和 RS485 组合，请保留 3 台上限。</p>
       <button type="button" class="secondary" id="reconnectGatewayButton">按已保存设置重新连接网关</button>

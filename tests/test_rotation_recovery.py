@@ -35,8 +35,11 @@ def test_valid_samples_lock_profile_across_collision_ble_error_and_stale_stream(
     g = s.gateway
     g._active_profile[mac] = 0
     # Field logs show samples can precede the final GATT-discovery OK.
+    s.states[mac].status = 'connecting'
     asyncio.run(s._handle_event(parse_gateway_line(REPLAY['valid'].replace(MACS[0], mac))))
     g._finish_connection(GatewayEvent('connected', mac, handle=0))
+    for incoming in g.poll():
+        asyncio.run(s._handle_event(incoming))
     for reason in ['SERIAL_COLLISION_SUSPECTED', 'DISSCONNECT (BLE code 22)']:
         g.connect(mac)
         g._commands.get_nowait()
@@ -79,7 +82,7 @@ def test_corruption_with_missing_connection_reply_still_requires_resync(monkeypa
     g._active_profile[MACS[0]] = 0
     g._serial = FakeSerial(lambda _: setattr(g, '_collision_detected', True))
     ticks = iter([0, 0, 100])
-    monkeypatch.setattr('app.gateway.time.monotonic', lambda: next(ticks))
+    monkeypatch.setattr('app.gateway.time.monotonic', lambda: next(ticks, 100))
     result = g._execute('AT+CONN=test', MACS[0])
     assert result.kind == 'error' and 'SERIAL_COLLISION_SUSPECTED' in result.message
     assert g._desynced and MACS[0] not in g.active_links

@@ -28,6 +28,8 @@ class GatewayEvent:
     message: str | None = None
     addr_id: int | None = None
     addr_type: int | None = None
+    mtu: int | None = None
+    service_count: int | None = None
 
 
 def parse_gateway_line(line: str) -> GatewayEvent | None:
@@ -101,9 +103,11 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
                     return GatewayEvent("error", mac, message=message)
                 if int(parts[1]) == 65535:
                     return GatewayEvent("error", mac, message=f"CONN_FAILED: {line}")
-                return GatewayEvent("connected", mac, handle=int(parts[1]))
+                return GatewayEvent("connected", mac, handle=int(parts[1]),
+                                    mtu=int(parts[4]), service_count=int(parts[3]))
             if len(parts) >= 4 and len(parts[1]) == 12:
-                return GatewayEvent("connected", normalize_mac(parts[1]), handle=int(parts[0]))
+                return GatewayEvent("connected", normalize_mac(parts[1]), handle=int(parts[0]),
+                                    mtu=int(parts[3]), service_count=int(parts[2]))
         except ValueError:
             return None
     return None
@@ -145,7 +149,10 @@ class SerialGateway:
         ("配对连接/自动地址", 247, 1, False),
     )
 
-    def __init__(self, port: str, baudrate: int, connect_timeout_seconds: int = 40) -> None:
+    def __init__(self, port: str, baudrate: int, connect_timeout_seconds: int = 40, *, connection_profile: int = -1) -> None:
+        if connection_profile not in {-1, 0, 1, 2, 3}:
+            raise ValueError("invalid connection profile")
+        self.connection_profile = connection_profile
         self.port_name = port
         self.baudrate = baudrate
         self.connect_timeout_seconds = connect_timeout_seconds
@@ -200,6 +207,9 @@ class SerialGateway:
         self.recent_lines: deque[str] = deque(maxlen=200)
         self.last_response_at: float | None = None
         self.addresses: dict[str, tuple[int, int]] = {}
+        self.address_seen_at: dict[str, float] = {}
+        self.connection_finished_at = 0.0
+        self.connection_finished_sequence = 0
         self._profile_cursor: dict[str, int] = {}
         self._preferred_profile: dict[str, int] = {}
         self._active_profile: dict[str, int] = {}
@@ -315,8 +325,12 @@ class SerialGateway:
         mac = normalize_mac(mac)
         timeout_ms = int(self.connect_timeout_seconds * 1000)
         index = self._preferred_profile.get(mac, self._profile_cursor.get(mac, 0))
+        if self.connection_profile >= 0:
+            index = self.connection_profile
         label, mtu, security, use_scanned_address = self.CONNECTION_PROFILES[index]
-        address = self.addresses.get(mac) if use_scanned_address else None
+        seen_at = self.address_seen_at.get(mac)
+        address = self.addresses.get(mac) if (use_scanned_address and
+                  (seen_at is None or time.monotonic() - seen_at <= 60.0)) else None
         address_fields = f"{address[0]},{address[1]}" if address else ","
         self._active_profile[mac] = index
         logger.info("CONNECT mac=%s profile=%s address=%s", mac, label, address)
@@ -719,6 +733,9 @@ class SerialGateway:
 
     def _finish_connection(self, event: GatewayEvent) -> GatewayEvent:
         mac = event.mac
+        if mac in self._active_profile:
+            self.connection_finished_at = time.monotonic()
+            self.connection_finished_sequence += 1
         if mac and event.kind == "connected":
             self._connected[mac] = event.handle if event.handle is not None else 0
             index = self._active_profile.pop(mac, None)
@@ -814,6 +831,7 @@ class SerialGateway:
             if event.kind == "scan" and event.mac and event.addr_id is not None and event.addr_type is not None:
                 self._scanning = True
                 self.addresses[event.mac] = (event.addr_id, event.addr_type)
+                self.address_seen_at[event.mac] = time.monotonic()
             elif event.kind == "connected" and event.mac:
                 self._connected[event.mac] = event.handle if event.handle is not None else 0
             elif event.kind == "disconnected" and event.mac:

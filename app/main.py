@@ -43,6 +43,8 @@ class DeviceUpdate(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
+    sensor_frame_bytes: Literal[28, 32] | None = None
+    serial_connection_profile: Literal[-1, 0, 1, 2, 3] | None = None
     gateway_driver: Literal["simulator", "serial"] | None = None
     serial_port: str | None = Field(None, min_length=3, max_length=20)
     baudrate: int | None = Field(None, ge=1200, le=921600)
@@ -352,7 +354,7 @@ async def update_settings(payload: SettingsUpdate):
     values = payload.model_dump(exclude_none=True)
     requires_gateway_restart = any(
         key in values and values[key] != getattr(settings, key)
-        for key in ("gateway_driver", "serial_port", "baudrate", "connect_timeout_seconds")
+        for key in ("gateway_driver", "serial_port", "baudrate", "connect_timeout_seconds", "sensor_frame_bytes", "serial_connection_profile")
     )
     try:
         settings.update(values)
