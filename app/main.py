@@ -24,6 +24,7 @@ from .database import Database
 from .scheduler import Scheduler
 from .diagnostics import VERSION, configure_logging, diagnostic_archive
 from .protocol import normalize_mac
+from .serial_ports import available_ports
 
 
 class DeviceCreate(BaseModel):
@@ -127,6 +128,11 @@ async def reconnect_gateway():
     logging.getLogger(__name__).info("User requested gateway reconnect")
     await scheduler.restart_gateway()
     return {"ok": True, "gateway": scheduler.snapshot()["gateway"]}
+
+
+@app.get("/api/serial/ports")
+def serial_ports():
+    return {"ports": available_ports()}
 
 
 @app.get("/api/dashboard")

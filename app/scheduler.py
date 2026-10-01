@@ -31,6 +31,7 @@ class DeviceRuntime:
     rssi: int | None = None
     error: str | None = None
     latest: dict[str, Any] | None = None
+    last_valid_sample: dict[str, Any] | None = None
     recovery_reason: str | None = None
     manual_paused: bool = False
     disconnect_requested: bool = False
@@ -169,6 +170,7 @@ class Scheduler:
             state.last_sample_at = None
             state.rssi = None
             state.latest = None
+            state.last_valid_sample = None
             state.recovery_reason = None
             state.data_stable_since = None
             state.early_notifications.clear()
@@ -394,6 +396,7 @@ class Scheduler:
                 self.gateway_error = None
         state.failures = 0
         state.latest = sample.as_dict()
+        state.last_valid_sample = state.latest
         thresholds = self._device_configs.get(sample.mac, {}).get("thresholds", {})
         state.alarm = evaluate_alarm(sample, thresholds)
         persist_interval = self.settings.persist_interval_seconds
@@ -493,6 +496,12 @@ class Scheduler:
         # EW-DTU02 supports several established links, but only one connection
         # procedure/GATT discovery should be in flight at a time.
         if any(state.status in {"connecting", "disconnecting"} for state in self.states.values()):
+            return
+        if self.settings.gateway_driver == "ble" and any(
+            s.last_sample_at is None or now - s.last_sample_at > 10.0
+            or s.data_stable_since is None or now - s.data_stable_since < self.DATA_SETTLE_SECONDS
+            for s in active
+        ):
             return
         if now < getattr(self, "_connect_ready_at", 0.0):
             return
@@ -796,12 +805,14 @@ class Scheduler:
             "is_focus": state.mac == self.focus_mac,
             "connected_seconds": round(now - state.connected_at, 1) if state.connected_at else None,
             "last_seen_seconds_ago": round(now - state.last_seen, 1) if state.last_seen else None,
+            "last_discovered_seconds_ago": round(now - state.last_discovered, 1) if state.last_discovered else None,
             "last_sample_seconds_ago": round(now - state.last_sample_at, 1) if state.last_sample_at else None,
             "collecting": state.status == "connected" and state.last_sample_at is not None and now - state.last_sample_at <= 10,
             "rssi": state.rssi,
             "failures": state.failures,
             "error": state.error,
-            "latest": state.latest,
+            "latest": state.latest or state.last_valid_sample,
+            "retry_seconds": round(max(0, state.retry_at - now), 1),
             "alarm": state.alarm,
         }
 

@@ -20,7 +20,7 @@ from app.diagnostics import VERSION
 
 def smoke_test(bundle: Path) -> None:
     # Use a copy so the shipping folder contains no test data or settings.
-    with tempfile.TemporaryDirectory(prefix='wtvb-smoke-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='wtvb-smoke-', dir=ROOT / 'work') as temporary:
         test = Path(temporary) / 'WTVB-Monitor'
         shutil.copytree(bundle, test)
         settings_path = test / 'config' / 'settings.json'
@@ -77,7 +77,9 @@ def main() -> None:
     if sys.platform != 'win32' or sys.maxsize <= 2**32:
         raise SystemExit('Build this release using 64-bit Python on Windows.')
     os.chdir(ROOT)
-    subprocess.run([sys.executable, '-m', 'pytest', '-q'], check=True)
+    (ROOT / 'work').mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='pytest-build-', dir=ROOT / 'work') as temporary:
+        subprocess.run([sys.executable, '-m', 'pytest', '-q', '--basetemp', str(Path(temporary) / 'run')], check=True)
     subprocess.run([
         sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
         '--name', 'WTVB-Monitor', '--add-data', f'{ROOT / "app" / "static"};app/static',
@@ -91,6 +93,7 @@ def main() -> None:
     shutil.copy2(ROOT / 'config' / 'settings.json', bundle / 'config' / 'settings.json')
     for name in ('README.md', '现场测试说明.md', 'RELEASE_NOTES.md'):
         shutil.copy2(ROOT / name, bundle / name)
+    shutil.copytree(ROOT / 'docs', bundle / 'docs', dirs_exist_ok=True)
     smoke_test(bundle)
     name = f'WTVB-Monitor-v{VERSION}-windows-x64'
     archive = Path(shutil.make_archive(str(ROOT / 'release' / name), 'zip', bundle.parent, bundle.name))

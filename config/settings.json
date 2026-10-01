@@ -1,8 +1,8 @@
 {
-  "gateway_driver": "serial",
-  "serial_port": "COM3",
+  "gateway_driver": "ble",
+  "serial_port": "auto",
   "baudrate": 115200,
-  "max_connections": 4,
+  "max_connections": 5,
   "serial_concurrency_limit": 3,
   "dwell_seconds": 180,
   "connect_timeout_seconds": 40,

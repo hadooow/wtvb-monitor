@@ -187,7 +187,10 @@ def test_unavailable_port_uses_backoff_without_repeated_open_each_loop(tmp_path,
     monkeypatch.setattr('app.scheduler.time.monotonic', lambda: clock[0])
     async def publish(_):
         pass
-    s = Scheduler(Database(tmp_path / 'test.db'), Settings(gateway_driver='serial'), publish)
+    # This test exercises reopening a configured port, independently of the
+    # machine's physical USB inventory. Auto selection has separate coverage.
+    monkeypatch.setattr('app.serial_ports.list_ports.comports', lambda: [])
+    s = Scheduler(Database(tmp_path / 'test.db'), Settings(gateway_driver='serial', serial_port='COM5'), publish)
     s.gateway.io_failed = True
     attempts = []
     def unavailable(*args, **kwargs):
