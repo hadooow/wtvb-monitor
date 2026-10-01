@@ -42,6 +42,9 @@ class Client:
         self.is_connected = False
         self.options['disconnected_callback'](self)
 
+    async def stop_notify(self, characteristic):
+        pass  # keep a saved late callback available for session-isolation tests
+
 
 def gateway(factory=Client):
     g = BleGateway(client_factory=factory, scanner_factory=lambda **kwargs: None)
@@ -60,6 +63,7 @@ def test_connect_uses_scanned_object_uncached_services_no_pair_and_commits_after
         client = g._clients[MAC]
         assert client.device is DEVICE
         assert client.options['pair'] is False
+        assert client.options['services'] == [SERVICE_UUID]
         assert client.options['winrt']['use_cached_services'] is False
         events = g.poll()
         assert [e.kind for e in events] == ['notify','connected']
@@ -94,22 +98,29 @@ def test_failed_stage_cleans_up_without_success(failure):
     asyncio.run(run())
 
 
-def test_session_handle_blocks_old_callbacks_and_disconnect_emits_once():
+def test_session_handle_blocks_old_callbacks_and_disconnect_emits_once(monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr('app.ble_gateway.time.monotonic', lambda: clock[0])
     async def run():
         g = gateway()
         g.connect(MAC)
         await asyncio.gather(*tuple(g._tasks))
         old = g._clients[MAC]
+        old_notify = old.notify
         old_handle = g._handles[MAC]
         g.poll()
         g.disconnect(MAC)
         await asyncio.gather(*tuple(g._tasks))
         assert [e.kind for e in g.poll()] == ['disconnected']
+        assert not g.discovered(MAC)
+        clock[0] += 3
+        g._detection(DEVICE, SimpleNamespace(rssi=-60, local_name=DEVICE.name))
+        g.poll()
         g.connect(MAC)
         await asyncio.gather(*tuple(g._tasks))
         assert g._handles[MAC] != old_handle
         g.poll()
-        old.notify(None,b'late')
+        old_notify(None,b'late')
         old.options['disconnected_callback'](old)
         assert not g.poll() and MAC in g._clients
         current = g._clients[MAC]
