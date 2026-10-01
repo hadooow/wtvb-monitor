@@ -44,8 +44,9 @@
     <form id="settingsForm">
       <div class="dialog-title"><h2>采集设置</h2><button type="button" data-close="settingsDialog" class="icon-button" aria-label="关闭">×</button></div>
       <label>网关模式<select name="gateway_driver"><option value="simulator">模拟网关（测试用）</option><option value="serial">真实 EW-DTU02 网关</option><option value="ble">Windows 电脑蓝牙直连（新功能）</option></select></label>
-      <p class="hint">电脑直连需开启 Windows 蓝牙，先用一台传感器测试；使用 FFE5/FFE4 服务，不主动配对或改写传感器。串口连接方式只对 EW-DTU02 有效。</p>
-      <label>真实网关串口<input name="serial_port" placeholder="COM3"></label>
+      <p class="hint">电脑直连需开启 Windows 蓝牙。桌面 5 台传感器已预置；蓝牙测试请拔下传感器 Type-C 线，并退出手机 APP 的设备连接。</p>
+      <label>真实网关串口<select name="serial_port"><option value="auto">自动选择唯一 USB 串口</option></select></label>
+      <p class="hint" id="serialPortHint">串口列表会显示 USB 网关与蓝牙虚拟串口。电脑蓝牙直连无需选择 COM 口。</p>
       <label>串口波特率<input name="baudrate" type="number" min="1200" max="921600" required></label>
       <label>连接超时（秒，手册建议 40）<input name="connect_timeout_seconds" type="number" min="5" max="60" required></label>
       <label>目标同时连接数量<input name="max_connections" type="number" min="1" max="7"></label>
@@ -58,7 +59,7 @@
       <p class="hint">排查时可将连接数量设为 1，再固定一种方式对照测试；没有确认原因前请保留自动兼容。</p>
       <p class="hint">只有确认传感器回传 28 字节时才切换格式，保存后重新连接网关。</p>
       <p class="hint">切换网关模式会立即重新连接。使用真实网关前，请关闭厂商上位机，避免两个程序同时占用串口。</p>
-      <p class="hint">真实 EW-DTU02 + 115200 RS485 默认最多同时连接 3 台；更多已登记设备将在采集轮换中逐台切换。除非已验证网关和 RS485 组合，请保留 3 台上限。</p>
+      <p class="hint">真实 EW-DTU02 + 115200 RS485 默认最多同时连接 3 台；电脑蓝牙使用目标连接数量。多余设备按采集时长轮换，尚未扫描到的设备会继续等待。</p>
       <button type="button" class="secondary" id="reconnectGatewayButton">按已保存设置重新连接网关</button>
       <div class="dialog-actions"><button type="button" data-close="settingsDialog" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>

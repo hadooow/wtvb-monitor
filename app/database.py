@@ -95,6 +95,23 @@ class Database:
                 )
                 connection.execute("INSERT INTO migrations(name) VALUES(?)", (migration,))
 
+            # These four additional bench sensors were confirmed by both the
+            # home diagnostic archive and a live Windows BLE scan. FE6 already
+            # belongs to the original seed. Do not overwrite user registration.
+            migration = "v0.6.14-bench-sensors"
+            if not connection.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
+                now = datetime.now(timezone.utc).isoformat()
+                connection.executemany(
+                    "INSERT OR IGNORE INTO devices(mac,name,location,simulated,created_at) VALUES(?,?,?,?,?)",
+                    [(mac, name, "桌面测试", 0, now) for mac, name in (
+                        ("E95BEA0C2DE1", "桌面传感器2"),
+                        ("D169C0659EA8", "桌面传感器3"),
+                        ("C5AE323B69BC", "桌面传感器4"),
+                        ("D60F8E9D1899", "桌面传感器5"),
+                    )],
+                )
+                connection.execute("INSERT INTO migrations(name) VALUES(?)", (migration,))
+
             migration = "v0.6.2-default-addresses"
             if not connection.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
                 connection.execute(

@@ -23,7 +23,7 @@ def static_root() -> Path:
 @dataclass(slots=True)
 class Settings:
     gateway_driver: str = "simulator"
-    serial_port: str = "COM3"
+    serial_port: str = "auto"
     baudrate: int = 115200
     max_connections: int = 4
     serial_concurrency_limit: int = 3

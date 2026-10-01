@@ -44,7 +44,7 @@ def test_cbf1_upgrade_preserves_existing_device_and_does_not_resurrect_deleted(t
     existing = upgraded.get_device_by_mac(cbf1['mac'])
     assert existing['name'] == '现场自定义名称'
     assert existing['enabled'] is False
-    assert len(upgraded.list_devices()) == 8
+    assert len(upgraded.list_devices()) == 12
     upgraded.delete_device(existing['id'])
     assert Database(path).get_device_by_mac(cbf1['mac']) is None
 

@@ -27,10 +27,15 @@ const statusNames = {
 const axisColors = { x: "#55a7ff", y: "#ffbd59", z: "#ba8cff" };
 const $ = selector => document.querySelector(selector);
 const fmt = (value, digits = 1) => value === null || value === undefined || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(digits);
-const maxAxis = (sample, prefix) => sample ? Math.max(...["x", "y", "z"].map(axis => Math.abs(Number(sample[`${prefix}_${axis}`] ?? 0)))) : null;
+const maxAxis = (sample, prefix) => {
+  const values = ["x", "y", "z"].map(axis => sample?.[`${prefix}_${axis}`]).filter(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
+  return values.length ? Math.max(...values.map(value => Math.abs(Number(value)))) : null;
+};
 
 function errorText(value) {
   if (!value) return "";
+  if (value.includes("SERIAL_BLUETOOTH_PORT")) return "所选 COM 口是蓝牙虚拟串口，请选择 USB 网关端口或切换电脑蓝牙直连";
+  if (value.includes("SERIAL_PORT_SELECTION")) return "请在采集设置中选择实际 USB 网关串口";
   if (value.includes("BLE_SERVICE_MISMATCH")) return "电脑已连接，但未找到 FFE5/FFE4 数据服务，请下载诊断核对";
   if (value.includes("BLE_CONNECT_FAILED")) return `电脑蓝牙连接失败 · ${value}`;
   if (value.includes("SERIAL_IO_ERROR")) return "串口读取或写入失败，正在自动重连网关";
@@ -40,7 +45,7 @@ function errorText(value) {
   if (value.includes("AT_RESPONSE_TIMEOUT")) return "网关回复不完整，正在同步网关连接状态";
   if (value.includes("AT_RESYNC_FAILED")) return "网关连接状态连续同步失败，请检查串口链路";
   if (value.includes("AT_ERROR")) return `网关拒绝指令，请下载日志查看详情${profile}`;
-  if (value.includes("TIMEOUT")) return `蓝牙连接超时${profile}`;
+  if (value.includes("TIMEOUT")) return `蓝牙连接超时，请检查供电、Type-C 线及手机连接${profile}`;
   if (value.includes("DISSCONNECT") && value.includes("34")) return `无线链路响应超时（BLE 34）${profile}`;
   if (value.includes("DISSCONNECT")) return `传感器主动断开或链路中断${profile}`;
   if (value.includes("SERVICE_NOT_FOUND")) return `未找到传感器数据服务${profile}`;
@@ -79,7 +84,7 @@ function render() {
   if (gateway.data_recovery_seconds > 0) warnings.push(`连接操作刚结束，正在观察数据恢复（约 ${Math.ceil(gateway.data_recovery_seconds)} 秒）`);
   if (gateway.io_failed) warnings.push(`串口自动重连等待约 ${Math.ceil(gateway.automatic_reconnect_seconds || 0)} 秒`);
   if (gateway.scan_start_failures && !gateway.faulted) warnings.push(`网关暂时拒绝启动扫描（第 ${gateway.scan_start_failures} 次），正在同步连接状态，稍后重试`);
-  if (gateway.warning_count) warnings.push(`已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${new Date(gateway.last_warning.time).toLocaleTimeString()}。详情见诊断日志。`);
+  if (gateway.warning_count) warnings.push(`已丢弃 ${gateway.warning_count} 条损坏或不支持的数据通知。最近一次：${gateway.last_warning?.time ? new Date(gateway.last_warning.time).toLocaleTimeString() : "见诊断日志"}。详情见诊断日志。`);
   warning.hidden = !warnings.length;
   warning.textContent = warnings.join("。 ");
   const connected = devices.filter(device => device.runtime.status === "connected").length;
@@ -112,7 +117,7 @@ function renderCards(devices) {
   grid.innerHTML = ordered.map(device => {
     const runtime = device.runtime;
     const live = Boolean(runtime.collecting);
-    const sample = live ? runtime.latest : null;
+    const sample = runtime.latest;
     const alarm = live ? (runtime.alarm || { level: "normal", reasons: [] }) : { level: "normal", reasons: [] };
     const badgeClass = alarm.level !== "normal" ? alarm.level : runtime.status;
     const connectionLabel = runtime.status === "connected" && !live ? "已连接 · 等待数据" : statusNames[runtime.status] || runtime.status;
@@ -120,7 +125,7 @@ function renderCards(devices) {
     const badgeText = alarm.level === "alarm" ? `${connectionLabel} · 报警` : alarm.level === "warning" ? `${connectionLabel} · 预警` : runtime.is_focus && live ? `${connectionLabel} · 实时优先` : runtime.is_focus ? `${connectionLabel} · 已优先` : `${connectionLabel}${queuePosition}`;
     const alarmReason = alarm.reasons?.map(item => `${item.label} ${fmt(item.value)} ${item.unit}`).join(" · ") || "";
     const reason = alarmReason || (runtime.error ? `连接失败：${errorText(runtime.error)}` : "");
-    const timeText = sample ? new Date(sample.timestamp).toLocaleTimeString() : live ? "等待数据" : "当前未采集";
+    const timeText = sample ? `${live ? "实时数据" : "最近有效值 · 当前未采集"} ${new Date(sample.timestamp).toLocaleTimeString()}` : runtime.status === "connecting" ? "正在连接，等待首条数据" : runtime.last_discovered_seconds_ago == null && device.enabled && !runtime.manual_paused ? "尚未扫描到，请检查供电与距离" : "等待有效数据";
     const rssiText = runtime.rssi !== null && runtime.rssi !== undefined ? ` · ${runtime.rssi} dBm` : "";
     return `<article class="device-card ${runtime.is_focus ? "focus" : ""} ${alarm.level}">
       <div class="device-head">
@@ -289,7 +294,7 @@ function renderMonitor() {
   if (!device) return;
   const runtime = device.runtime;
   const live = Boolean(runtime.collecting);
-  const sample = live ? runtime.latest : null;
+  const sample = runtime.latest;
   const focused = state.focusMac === device.mac;
   $("#monitorTitle").textContent = device.name;
   $("#monitorMeta").textContent = `${device.mac_display} · ${device.location || "未填写安装位置"} · ${statusNames[runtime.status] || runtime.status}`;
@@ -300,11 +305,11 @@ function renderMonitor() {
   const alarmText = live && runtime.alarm?.reasons?.length
     ? runtime.alarm.reasons.map(item => `${item.label} ${fmt(item.value)} ${item.unit}（阈值 ${fmt(item.threshold)}）`).join("；")
     : "";
-  $("#monitorMessage").textContent = alarmText || (runtime.manual_paused
+  $("#monitorMessage").textContent = (!live && sample ? `当前未采集，以下为最近有效值（${new Date(sample.timestamp).toLocaleString()}）。` : "") + (alarmText || (runtime.manual_paused
     ? "该设备已手动断开；点击“重新连接”后将重新加入调度。此操作不会更改设备启用设置。"
     : focused
     ? `${statusNames[runtime.status] || runtime.status} · 当前设备拥有最高连接优先级，页面关闭后将自动释放`
-    : `${statusNames[runtime.status] || runtime.status} · 点击“优先连接并实时监控”可优先占用一个连接通道`);
+    : `${statusNames[runtime.status] || runtime.status} · 点击“优先连接并实时监控”可优先占用一个连接通道`));
   renderDiagnostics(runtime);
   $("#temperatureNow").textContent = `${fmt(sample?.temperature)} °C`;
   renderAxisValues("velocityNow", sample, "velocity", "mm/s", 0);
@@ -318,17 +323,18 @@ function renderMonitor() {
 function renderDiagnostics(runtime) {
   const panel = $("#diagnosticPanel");
   const gateway = state.dashboard.gateway;
-  const realMode = gateway.driver === "serial";
+  const realMode = ["serial", "ble"].includes(gateway.driver);
   panel.classList.toggle("hidden", !realMode);
   if (!realMode) return;
-  const seen = runtime.last_seen_seconds_ago !== null && runtime.last_seen_seconds_ago !== undefined;
+  const seen = runtime.last_discovered_seconds_ago !== null && runtime.last_discovered_seconds_ago !== undefined;
   const rssi = runtime.rssi;
   const weak = rssi !== null && rssi !== undefined && rssi < -75;
   panel.innerHTML = `
     <div><span>${gateway.driver === "ble" ? "电脑蓝牙" : "485 / USB 网关"}</span><strong>${gateway.driver === "ble" ? (gateway.online ? "直连驱动运行中" : "直连驱动未启动") : gateway.online ? (gateway.last_response_seconds_ago === null ? "串口已打开，尚无回复" : `最近回复 ${gateway.last_response_seconds_ago} 秒前`) : "串口未打开"}</strong></div>
     <div class="${weak ? "weak" : ""}"><span>传感器广播</span><strong>${seen ? `已发现 · ${rssi ?? "—"} dBm${weak ? " · 信号弱" : ""}` : "尚未扫描到"}</strong></div>
     <div class="${runtime.error ? "failed" : ""}"><span>BLE 数据连接</span><strong>${runtime.status === "connected" ? (runtime.collecting ? "已连接并接收有效数据" : "已连接，等待有效数据") : runtime.status === "connecting" ? "正在建立连接" : escapeHtml(errorText(runtime.error)) || statusNames[runtime.status] || "等待连接"}</strong></div>
-    <div><span>串口诊断</span><strong>乱码 ${gateway.non_ascii_bytes ?? 0} 字节 · 疑似碰撞 ${gateway.serial_collision_suspected ?? 0} 次</strong></div>`;
+    <div><span>有效数据</span><strong>${runtime.last_sample_seconds_ago != null ? `最近有效样本 ${runtime.last_sample_seconds_ago} 秒前` : "尚未收到有效样本"}${runtime.status === "retrying" ? ` · ${Math.ceil(runtime.retry_seconds || 0)} 秒后重试` : ""}</strong></div>
+    ${gateway.driver === "serial" ? `<div><span>串口诊断</span><strong>乱码 ${gateway.non_ascii_bytes ?? 0} 字节 · 疑似碰撞 ${gateway.serial_collision_suspected ?? 0} 次</strong></div>` : ""}`;
 }
 
 function renderAxisValues(elementId, sample, prefix, unit, digits) {
@@ -561,10 +567,25 @@ document.querySelectorAll("[data-close]").forEach(button => {
   button.addEventListener("click", () => document.getElementById(button.dataset.close).close());
 });
 
-$("#settingsButton").addEventListener("click", () => {
+$("#settingsButton").addEventListener("click", async () => {
   const form = $("#settingsForm");
   const values = state.dashboard.settings;
   form.gateway_driver.value = values.gateway_driver;
+  form.serial_port.innerHTML = '<option value="auto">自动选择唯一 USB 串口</option>';
+  try {
+    const { ports } = await api("/api/serial/ports");
+    for (const port of ports) {
+      const option = new Option(`${port.device} · ${port.description}${port.bluetooth ? "（蓝牙虚拟串口，请勿用于网关）" : ""}`, port.device);
+      option.disabled = port.bluetooth;
+      form.serial_port.add(option);
+    }
+    $("#serialPortHint").textContent = ports.some(p => p.device === values.serial_port && p.bluetooth)
+      ? "之前选择的是蓝牙虚拟串口，请改选 USB 网关或电脑蓝牙直连。"
+      : "自动选口仅适用于唯一 USB 串口；多个 USB 串口时请选择实际网关。";
+  } catch (error) { $("#serialPortHint").textContent = error.message; }
+  if (![...form.serial_port.options].some(o => o.value === values.serial_port)) {
+    form.serial_port.add(new Option(`${values.serial_port}（当前未检测到）`, values.serial_port));
+  }
   form.serial_port.value = values.serial_port;
   form.baudrate.value = values.baudrate;
   form.connect_timeout_seconds.value = values.connect_timeout_seconds;

@@ -14,6 +14,7 @@ from typing import Literal
 import serial
 
 from .protocol import normalize_mac
+from .serial_ports import resolve_port
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ def parse_gateway_line(line: str) -> GatewayEvent | None:
             if len(parts) >= 5 and len(parts[2]) == 12:
                 mac = normalize_mac(parts[2])
                 if parts[-1] in {"DISSCONNECT", "TIMEOUT", "SERVICE_NOT_FOUND", "CCCD_ERROR", "CNN_BUSY"}:
-                    code = parts[3] if parts[-1] == "DISSCONNECT" and parts[3] != "0" else ""
+                    code = parts[3] if parts[3] != "0" else ""
                     message = f"{parts[-1]} (BLE code {code})" if code else parts[-1]
                     return GatewayEvent("error", mac, message=message)
                 if int(parts[1]) == 65535:
@@ -313,6 +314,7 @@ class SerialGateway:
         if self._serial and self._serial.is_open:
             return
         try:
+            self.port_name = resolve_port(self.port_name)
             self._serial = serial.Serial(self.port_name, self.baudrate, timeout=0.2, write_timeout=1)
         except (serial.SerialException, OSError) as exc:
             self._io_failure(exc)

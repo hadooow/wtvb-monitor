@@ -43,6 +43,8 @@ class BleGateway:
         self.scanning = False
         self.last_scan_error = None
         self._intentional = set()
+        self._connecting = {}
+        self._pending_disconnects = {}
 
     @property
     def name(self):
@@ -54,7 +56,11 @@ class BleGateway:
 
     @property
     def busy(self):
-        return self._busy
+        return self._busy or bool(self._pending_disconnects)
+
+    @property
+    def active_links(self):
+        return dict(self._handles)
 
     def _record(self, kind, message):
         logger.info('BLE %s %s', kind, message)
@@ -70,6 +76,7 @@ class BleGateway:
 
     def stop(self):
         self._started = False
+        self._pending_disconnects.clear()
         for task in tuple(self._tasks):
             task.cancel()
 
@@ -83,6 +90,7 @@ class BleGateway:
                 logger.exception('BLE shutdown disconnect failed')
         self._clients.clear()
         self._handles.clear()
+        self._connecting.clear()
 
     def _launch(self, coroutine):
         self._busy = True
@@ -96,6 +104,13 @@ class BleGateway:
             await coroutine
         finally:
             self._busy = False
+            self._drain_disconnects()
+
+    def _drain_disconnects(self):
+        if self._started and not self._busy and self._pending_disconnects:
+            mac = next(iter(self._pending_disconnects))
+            handle = self._pending_disconnects.pop(mac)
+            self._launch(self._disconnect(mac, expected_handle=handle))
 
     def _detection(self, device, advertisement):
         if not self._started:
@@ -160,6 +175,7 @@ class BleGateway:
         self._launch(self._connect(mac, self._sequence))
 
     async def _connect(self, mac, handle):
+        self._connecting[mac] = handle
         client = None
         ready = False
         stage = 'connect_and_services'
@@ -212,6 +228,7 @@ class BleGateway:
             if self._started:
                 self.events.put(GatewayEvent('error', mac, message=f'BLE_CONNECT_FAILED stage={stage}: {type(exc).__name__}: {exc}'))
         finally:
+            self._connecting.pop(mac, None)
             if not ready and client is not None:
                 if self._clients.get(mac) is client:
                     self._clients.pop(mac, None)
@@ -222,12 +239,22 @@ class BleGateway:
                     logger.exception('BLE failed connection cleanup')
 
     def disconnect(self, mac):
-        if self._started and not self.busy:
-            self._launch(self._disconnect(normalize_mac(mac)))
+        if self._started:
+            mac = normalize_mac(mac)
+            # Pause/delete can arrive while another device is connecting or
+            # while scanning. Preserve the operation and the target session.
+            handle = self._handles.get(mac, self._connecting.get(mac))
+            self._pending_disconnects.setdefault(mac, handle)
+            self._drain_disconnects()
 
-    async def _disconnect(self, mac):
+    async def _disconnect(self, mac, expected_handle=None):
         client = self._clients.get(mac)
         handle = self._handles.get(mac)
+        if expected_handle is not None and handle != expected_handle:
+            # A link-loss event already released this generation. Never let
+            # the old request tear down a later connection to the same MAC.
+            self._record('stale_disconnect', f'{mac} expected={expected_handle} current={handle}')
+            return
         self._intentional.add((mac, handle))
         try:
             if client is not None:
@@ -265,6 +292,7 @@ class BleGateway:
 
     def diagnostics(self):
         return {'online': self.online, 'busy': self.busy, 'scanning': self.scanning,
+                'pending_disconnects': list(self._pending_disconnects),
                 'ble_scan_error': self.last_scan_error,
                 'active_connections': len(self._clients), 'event_history': list(self.history),
                 'gatt_services': self.gatt, 'notification_stats': self.notifications, 'discovered_devices': [
