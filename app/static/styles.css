@@ -44,8 +44,9 @@ h2 { font-size: 20px; font-weight: 650; }
 .eyebrow { color: var(--cyan); font-size: 11px; letter-spacing: .18em; margin-bottom: 7px; }
 .top-actions, .dialog-actions, .monitor-actions { display: flex; align-items: center; gap: 10px; }
 button, select, input { font: inherit; }
-button { border: 0; cursor: pointer; border-radius: 10px; padding: 10px 15px; transition: .18s ease; }
-button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+button { border: 0; cursor: pointer; border-radius: 10px; padding: 10px 15px; transition: background-color .18s ease, filter .18s ease; }
+button:hover { filter: brightness(1.08); }
+button:disabled { cursor: wait; opacity: .65; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 .primary { background: var(--cyan); color: #06221f; font-weight: 700; }
 .secondary { background: #17313a; color: var(--text); border: 1px solid var(--line); }
@@ -106,15 +107,19 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .empty-state strong { color: var(--text); }
 
 .hidden { display: none !important; }
-dialog { width: min(470px, calc(100% - 30px)); border: 1px solid var(--line); border-radius: 16px; background: #0d2027; color: var(--text); padding: 22px; box-shadow: var(--shadow); }
+dialog { width: min(470px, calc(100% - 30px)); max-width: calc(100% - 30px); max-height: calc(100dvh - 30px); overflow-y: auto; overflow-x: hidden; border: 1px solid var(--line); border-radius: 16px; background: #0d2027; color: var(--text); padding: 22px; box-shadow: var(--shadow); }
 dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(4px); }
-dialog form { display: grid; gap: 15px; }
+dialog form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 15px; min-width: 0; }
+dialog form > *, dialog label { min-width: 0; }
+dialog input, dialog select { width: 100%; min-width: 0; max-width: 100%; }
+dialog .hint { overflow-wrap: anywhere; }
+dialog .dialog-actions { flex-wrap: wrap; }
 .dialog-title { display: flex; align-items: center; justify-content: space-between; }
 .icon-button { background: transparent; color: var(--muted); font-size: 26px; padding: 0 7px; line-height: 1.2; }
 label { color: var(--muted); display: grid; gap: 7px; font-size: 13px; }
 select, input { background: #0a1a20; color: var(--text); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; outline: none; }
 select:focus, input:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(49,223,196,.1); }
-.threshold-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.threshold-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
 .dialog-actions { justify-content: flex-end; margin-top: 4px; }
 .split-actions { display: grid; grid-template-columns: auto 1fr auto auto; }
 .hint { color: var(--muted); font-size: 12px; line-height: 1.6; }

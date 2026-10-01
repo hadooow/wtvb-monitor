@@ -13,6 +13,7 @@ const state = {
   socket: null,
   historyRequest: 0,
   deleteDeviceId: null,
+  connectionRequests: new Set(),
 };
 
 const statusNames = {
@@ -100,10 +101,15 @@ function render() {
 
 function renderCards(devices) {
   const grid = $("#deviceGrid");
+  const registered = new Set(devices.map(device => String(device.id)));
+  grid.querySelectorAll("[data-device-id]").forEach(card => {
+    if (!registered.has(card.dataset.deviceId)) card.remove();
+  });
   if (!devices.length) {
-    grid.innerHTML = '<div class="empty-state"><strong>尚未登记设备</strong><span>点击右上角“添加设备”开始配置传感器。</span></div>';
+    if (!grid.querySelector(".empty-state")) grid.innerHTML = '<div class="empty-state"><strong>尚未登记设备</strong><span>点击右上角“添加设备”开始配置传感器。</span></div>';
     return;
   }
+  grid.querySelector(".empty-state")?.remove();
   const queueRank = new Map((state.dashboard?.queue_order || []).map((mac, index) => [mac, index]));
   const statusRank = { connected: 0, connecting: 1, disconnecting: 2, queued: 3, retrying: 3, paused: 4, disabled: 5 };
   const ordered = [...devices].sort((a, b) => {
@@ -114,7 +120,7 @@ function renderCards(devices) {
     if (aRank === 3) return (queueRank.get(a.mac) ?? Infinity) - (queueRank.get(b.mac) ?? Infinity);
     return a.id - b.id;
   });
-  grid.innerHTML = ordered.map(device => {
+  ordered.forEach(device => {
     const runtime = device.runtime;
     const live = Boolean(runtime.collecting);
     const sample = runtime.latest;
@@ -127,28 +133,54 @@ function renderCards(devices) {
     const reason = alarmReason || (runtime.error ? `连接失败：${errorText(runtime.error)}` : "");
     const timeText = sample ? `${live ? "实时数据" : "最近有效值 · 当前未采集"} ${new Date(sample.timestamp).toLocaleTimeString()}` : runtime.status === "connecting" ? "正在连接，等待首条数据" : runtime.last_discovered_seconds_ago == null && device.enabled && !runtime.manual_paused ? "尚未扫描到，请检查供电与距离" : "等待有效数据";
     const rssiText = runtime.rssi !== null && runtime.rssi !== undefined ? ` · ${runtime.rssi} dBm` : "";
-    return `<article class="device-card ${runtime.is_focus ? "focus" : ""} ${alarm.level}">
+    let card = grid.querySelector(`[data-device-id="${device.id}"]`);
+    if (!card) {
+      card = document.createElement("article");
+      card.dataset.deviceId = device.id;
+      card.innerHTML = `
       <div class="device-head">
-        <div><h3>${escapeHtml(device.name)}${device.simulated ? '<span class="tag">模拟</span>' : ""}</h3><p>${escapeHtml(device.location || device.mac_display)}</p></div>
-        <span class="status ${badgeClass}">${badgeText}</span>
+        <div><h3><span data-field="name"></span><span class="tag">模拟</span></h3><p data-field="location"></p></div>
+        <span data-field="status" class="status"></span>
       </div>
       <div class="card-values">
-        <div><span>温度</span><strong>${fmt(sample?.temperature)} °C</strong></div>
-        <div><span>最大速度</span><strong>${fmt(maxAxis(sample, "velocity"), 0)} mm/s</strong></div>
-        <div><span>最大位移</span><strong>${fmt(maxAxis(sample, "displacement"), 0)} μm</strong></div>
-        <div><span>最大频率</span><strong>${fmt(maxAxis(sample, "frequency"), 0)} Hz</strong></div>
+        <div><span>温度</span><strong data-field="temperature"></strong></div>
+        <div><span>最大速度</span><strong data-field="velocity"></strong></div>
+        <div><span>最大位移</span><strong data-field="displacement"></strong></div>
+        <div><span>最大频率</span><strong data-field="frequency"></strong></div>
       </div>
-      <div class="alarm-reason">${escapeHtml(reason)}</div>
+      <div class="alarm-reason" data-field="reason"></div>
       <div class="device-foot">
-        <span>${timeText}${rssiText}</span>
+        <span data-field="time"></span>
         <div class="card-actions">
           <button type="button" class="secondary" onclick="openDeviceSettings(${device.id})">设置</button>
-          ${device.enabled ? `<button type="button" class="secondary" onclick="toggleDeviceConnection(${device.id})">${runtime.manual_paused ? "重新连接" : "断开"}</button>` : ""}
+          <button type="button" data-field="connection" class="secondary" onclick="toggleDeviceConnection(${device.id})"></button>
           <button type="button" class="primary" onclick="openMonitor(${device.id})">实时监控</button>
         </div>
-      </div>
-    </article>`;
-  }).join("");
+      </div>`;
+      // Existing cards keep their nodes and positions during live updates.
+      // Replacing or moving a hovered button can cancel a mouse click.
+      grid.append(card);
+    }
+    const text = (field, value) => {
+      const node = card.querySelector(`[data-field="${field}"]`);
+      if (node.textContent !== value) node.textContent = value;
+      return node;
+    };
+    card.className = `device-card ${runtime.is_focus ? "focus" : ""} ${alarm.level}`;
+    text("name", device.name);
+    card.querySelector(".tag").hidden = !device.simulated;
+    text("location", device.location || device.mac_display);
+    text("status", badgeText).className = `status ${badgeClass}`;
+    text("temperature", `${fmt(sample?.temperature)} °C`);
+    text("velocity", `${fmt(maxAxis(sample, "velocity"), 0)} mm/s`);
+    text("displacement", `${fmt(maxAxis(sample, "displacement"), 0)} μm`);
+    text("frequency", `${fmt(maxAxis(sample, "frequency"), 0)} Hz`);
+    text("reason", reason);
+    text("time", `${timeText}${rssiText}`);
+    const connection = text("connection", runtime.manual_paused ? "重新连接" : "断开");
+    connection.hidden = !device.enabled;
+    connection.disabled = state.connectionRequests.has(device.id);
+  });
 }
 
 async function openMonitor(id) {
@@ -260,12 +292,18 @@ function renderHistoryCharts() {
 
 async function toggleDeviceConnection(id) {
   const device = state.dashboard?.devices.find(item => item.id === id);
-  if (!device) return;
+  if (!device || state.connectionRequests.has(id)) return;
+  state.connectionRequests.add(id);
+  render();
   try {
     const action = device.runtime.manual_paused ? "reconnect" : "disconnect";
     await api(`/api/devices/${id}/${action}`, { method: "POST" });
     await loadDashboard();
   } catch (error) { alert(error.message); }
+  finally {
+    state.connectionRequests.delete(id);
+    render();
+  }
 }
 
 async function switchMonitorTab(tab) {
