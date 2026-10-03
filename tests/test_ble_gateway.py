@@ -113,7 +113,7 @@ def test_session_handle_blocks_old_callbacks_and_disconnect_emits_once(monkeypat
         await asyncio.gather(*tuple(g._tasks))
         assert [e.kind for e in g.poll()] == ['disconnected']
         assert not g.discovered(MAC)
-        clock[0] += 3
+        clock[0] += 6
         g._detection(DEVICE, SimpleNamespace(rssi=-60, local_name=DEVICE.name))
         g.poll()
         g.connect(MAC)

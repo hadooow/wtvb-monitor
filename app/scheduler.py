@@ -299,7 +299,11 @@ class Scheduler:
                 state.last_cycle_at = time.monotonic()
                 # Try each compatibility profile promptly before applying the
                 # longer exponential backoff used for persistently absent units.
-                if state.failures <= 5:
+                if self.settings.gateway_driver == "ble":
+                    retry_delay = min(
+                        max(10, self.settings.reconnect_base_seconds) * 2 ** min(state.failures - 1, 4), 120
+                    )
+                elif state.failures <= 5:
                     retry_delay = min(self.settings.reconnect_base_seconds, 10)
                 else:
                     retry_delay = min(
@@ -467,6 +471,15 @@ class Scheduler:
         waiting = [state for state in self.states.values() if not state.manual_paused and state.status in {"queued", "retrying"} and state.retry_at <= now]
         if not waiting:
             return
+        if self.settings.gateway_driver == "ble":
+            # Never recycle a good link to make room when a slot is already
+            # free, or when the replacement has not advertised after release.
+            if len(self._connected_states()) < self._connection_limit():
+                return
+            waiting = [state for state in waiting if self.gateway.discovered(state.mac)]
+            if not waiting:
+                self.gateway.scan()
+                return
         for state in self.states.values():
             if (
                 state.status == "connected"

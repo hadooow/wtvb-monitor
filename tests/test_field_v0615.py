@@ -33,7 +33,7 @@ def test_disconnect_unsubscribes_before_release_and_requires_new_post_settle_ad(
         clock[0] += 1
         g._detection(DEVICE, SimpleNamespace(rssi=-60, local_name=DEVICE.name))
         assert not g.discovered(MAC)
-        clock[0] += 2
+        clock[0] += 5
         assert not g.discovered(MAC)  # old ad remains unusable after time passes
         g._detection(DEVICE, SimpleNamespace(rssi=-60, local_name=DEVICE.name))
         assert g.discovered(MAC)
@@ -63,7 +63,7 @@ def test_remote_link_loss_closes_retired_native_services_without_closing_new_pee
     asyncio.run(run())
 
 
-def test_missing_service_invalidates_discovery_and_targeted_retry_can_succeed(monkeypatch):
+def test_missing_service_invalidates_discovery_and_full_retry_can_succeed(monkeypatch):
     clock = [100.]
     monkeypatch.setattr('app.ble_gateway.time.monotonic', lambda: clock[0])
     clients = []
@@ -79,12 +79,12 @@ def test_missing_service_invalidates_discovery_and_targeted_retry_can_succeed(mo
         assert g.poll()[0].kind == 'error'
         assert clients[0].disconnects == 1
         assert not g.discovered(MAC)
-        clock[0] += 3
+        clock[0] += 11
         g._detection(DEVICE, SimpleNamespace(rssi=-60, local_name=DEVICE.name))
         g.poll()
         g.connect(MAC)
         await finish(g)
-        assert clients[1].options['services'] == [SERVICE_UUID]
+        assert clients[1].options['services'] is None
         assert g.poll()[-1].kind == 'connected'
         await g.aclose()
     asyncio.run(run())

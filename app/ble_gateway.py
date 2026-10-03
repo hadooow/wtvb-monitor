@@ -47,6 +47,9 @@ class BleGateway:
         self._pending_disconnects = {}
         self._retired_clients = deque()
         self._rediscover_after = {}
+        self._full_discovery = set()
+        self._subscribed = set()
+        self._cleanup_retry = {}
 
     @property
     def name(self):
@@ -85,9 +88,9 @@ class BleGateway:
     async def aclose(self):
         self.stop()
         await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
-        for client in tuple(self._clients.values()):
+        for mac, client in tuple(self._clients.items()):
             try:
-                await self._release_client('shutdown', client)
+                await self._release_client(mac, client)
             except Exception:
                 logger.exception('BLE shutdown disconnect failed')
         while self._retired_clients:
@@ -99,6 +102,13 @@ class BleGateway:
         self._clients.clear()
         self._handles.clear()
         self._connecting.clear()
+        for mac, (client, _) in tuple(self._cleanup_retry.items()):
+            try:
+                await self._release_client(mac, client)
+            except Exception:
+                logger.exception('BLE deferred shutdown cleanup failed')
+        self._cleanup_retry.clear()
+        self._subscribed.clear()
 
     def _launch(self, coroutine):
         self._busy = True
@@ -134,7 +144,25 @@ class BleGateway:
             raise
         except Exception:
             logger.exception('BLE retired client cleanup failed')
+            self._defer_cleanup(mac, client)
+        else:
+            self._require_rediscovery(mac)
         self._retired_clients.popleft()
+
+    def _defer_cleanup(self, mac, client):
+        # Retain native ownership but let healthy peers continue collecting.
+        self._cleanup_retry[mac] = (client, time.monotonic() + 30)
+        self._record('cleanup_deferred', f'{mac}; retry native release in 30s')
+
+    def _retry_cleanup(self):
+        if not self._started or self.busy:
+            return
+        for mac, (client, due) in tuple(self._cleanup_retry.items()):
+            if time.monotonic() >= due:
+                del self._cleanup_retry[mac]
+                self._retired_clients.append((mac, client))
+                self._drain_disconnects()
+                break
 
     def _detection(self, device, advertisement):
         if not self._started:
@@ -158,21 +186,22 @@ class BleGateway:
                                          message=advertisement.local_name or device.name))
 
     def discovered(self, mac):
-        return (mac in self._devices and time.monotonic() - self._seen[mac] <= 60
+        return (mac not in self._cleanup_retry
+                and mac in self._devices and time.monotonic() - self._seen[mac] <= 60
                 and self._seen[mac] >= self._rediscover_after.get(mac, float('-inf')))
 
-    def _require_rediscovery(self, mac):
+    def _require_rediscovery(self, mac, settle=5.0):
         # A Windows session close is not proof that the radio/peripheral has
         # finished releasing it. Require a new advertisement after settling.
         self._devices.pop(mac, None)
         self._seen.pop(mac, None)
         self._last_ad_event.pop(mac, None)
-        self._rediscover_after[mac] = time.monotonic() + 2.0
+        self._rediscover_after[mac] = time.monotonic() + settle
         if len(self._rediscover_after) > 256:
             self._rediscover_after.pop(next(iter(self._rediscover_after)))
 
     async def _release_client(self, mac, client):
-        if client.is_connected:
+        if client.is_connected and client in self._subscribed:
             try:
                 await asyncio.wait_for(client.stop_notify(NOTIFY_UUID), 3)
             except Exception as exc:
@@ -180,6 +209,7 @@ class BleGateway:
         # Bleak disconnect closes the native GATT services, even for a client
         # whose remote link is already lost. Do not only discard the Python map.
         await asyncio.wait_for(client.disconnect(), 10)
+        self._subscribed.discard(client)
 
     def scan(self):
         if self._started and not self.busy and time.monotonic() - self._last_scan >= 10:
@@ -191,7 +221,7 @@ class BleGateway:
         try:
             scanner = self._scanner_factory(detection_callback=self._detection)
             self._scanner = scanner
-            await scanner.start()
+            await asyncio.wait_for(scanner.start(), 10)
             self.last_scan_error = None
             self.scanning = True
             await asyncio.sleep(5)
@@ -203,7 +233,7 @@ class BleGateway:
         finally:
             try:
                 if scanner is not None:
-                    await scanner.stop()
+                    await asyncio.wait_for(scanner.stop(), 10)
             except Exception as exc:
                 self._record('scan_stop_failed', str(exc))
             self.scanning = False
@@ -212,6 +242,8 @@ class BleGateway:
     def connect(self, mac):
         mac = normalize_mac(mac)
         if not self._started or self.busy:
+            return
+        if mac in self._clients:
             return
         if not self.discovered(mac):
             self.events.put(GatewayEvent('error', mac, message='BLE_NOT_DISCOVERED: 60 秒内未扫描到设备'))
@@ -224,6 +256,8 @@ class BleGateway:
         client = None
         ready = False
         stage = 'connect_and_services'
+        started_at = time.monotonic()
+        profile = 'full_uncached' if mac in self._full_discovery else 'targeted_uncached'
         def disconnected(_client):
             if ready and self._started and (mac, handle) not in self._intentional and self._clients.get(mac) is _client:
                 self._clients.pop(mac, None)
@@ -234,7 +268,8 @@ class BleGateway:
                 self.events.put(GatewayEvent('disconnected', mac, handle=handle,
                                              message='BLE_LINK_LOST: Windows 蓝牙连接断开'))
         def notification(_sender, data):
-            if self._started and self._clients.get(mac) is client and self._handles.get(mac) == handle:
+            if (self._started and (mac, handle) not in self._intentional
+                    and self._clients.get(mac) is client and self._handles.get(mac) == handle):
                 stats = self.notifications.setdefault(mac, {'count': 0, 'lengths': {}, 'last_hex': ''})
                 stats['count'] += 1
                 length = str(len(data))
@@ -242,8 +277,9 @@ class BleGateway:
                 stats['last_hex'] = bytes(data[:64]).hex()
                 self.events.put(GatewayEvent('notify', mac, handle=handle, payload=bytes(data)))
         try:
+            self._record('connect_attempt', f'{mac} handle={handle} profile={profile} timeout={self.timeout}s')
             client = self._client_factory(self._devices[mac], pair=False, timeout=self.timeout,
-                                          services=[SERVICE_UUID],
+                                          services=None if mac in self._full_discovery else [SERVICE_UUID],
                                           winrt={'use_cached_services': False},
                                           disconnected_callback=disconnected)
             await asyncio.wait_for(client.connect(), self.timeout)
@@ -259,23 +295,30 @@ class BleGateway:
             service = client.services.get_service(SERVICE_UUID)
             characteristic = next((c for c in service.characteristics if c.uuid.lower() == NOTIFY_UUID), None) if service else None
             if characteristic is None or 'notify' not in characteristic.properties:
+                # A UUID-filtered WinRT query can return an empty collection
+                # after reconnect. Recreate the session and enumerate all
+                # services on the next fresh-advertisement attempt.
+                self._full_discovery.add(mac)
+                self._record('service_recovery', f'{mac}; next attempt=full_uncached')
                 raise RuntimeError('BLE_SERVICE_MISMATCH: 未获得 FFE5/FFE4 notify 服务；释放连接并重新扫描后重试')
             self._clients[mac] = client
             self._handles[mac] = handle
             stage = 'subscribe_notify'
             await asyncio.wait_for(client.start_notify(characteristic, notification), 10)
+            self._subscribed.add(client)
             if not client.is_connected or not self._started:
                 raise RuntimeError('BLE_LINK_LOST during notification subscription')
             ready = True
             self.events.put(GatewayEvent('connected', mac, handle=handle,
                                          mtu=client.mtu_size, service_count=len(services)))
-            self._record('connected', mac)
+            self._record('connected', f'{mac} profile={profile} elapsed={time.monotonic()-started_at:.2f}s')
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._record('connect_failed', f'{mac} stage={stage}: {type(exc).__name__}: {exc}')
+            detail = str(exc) or f'operation exceeded {self.timeout if stage == "connect_and_services" else 10}s'
+            self._record('connect_failed', f'{mac} stage={stage} profile={profile} elapsed={time.monotonic()-started_at:.2f}s: {type(exc).__name__}: {detail}')
             if self._started:
-                self.events.put(GatewayEvent('error', mac, message=f'BLE_CONNECT_FAILED stage={stage}: {type(exc).__name__}: {exc}'))
+                self.events.put(GatewayEvent('error', mac, handle=handle, message=f'BLE_CONNECT_FAILED stage={stage} profile={profile}: {type(exc).__name__}: {detail}'))
         finally:
             self._connecting.pop(mac, None)
             if not ready and client is not None:
@@ -286,8 +329,9 @@ class BleGateway:
                     await self._release_client(mac, client)
                 except Exception:
                     logger.exception('BLE failed connection cleanup')
+                    self._defer_cleanup(mac, client)
                 finally:
-                    self._require_rediscovery(mac)
+                    self._require_rediscovery(mac, settle=10.0)
 
     def disconnect(self, mac):
         if self._started:
@@ -318,6 +362,8 @@ class BleGateway:
                 self.events.put(GatewayEvent('info', mac, handle=handle, message=f'BLE_DISCONNECT_FAILED: {exc}'))
                 self.events.put(GatewayEvent('connected', mac, handle=handle))
                 return
+            if client is not None:
+                self._defer_cleanup(mac, client)
         finally:
             self._intentional.discard((mac, handle))
         if self._clients.get(mac) is client:
@@ -336,6 +382,7 @@ class BleGateway:
         self._record('no_data', mac)
 
     def poll(self, limit=500):
+        self._retry_cleanup()
         result = []
         for _ in range(limit):
             try:
@@ -348,6 +395,10 @@ class BleGateway:
         return {'online': self.online, 'busy': self.busy, 'scanning': self.scanning,
                 'pending_disconnects': list(self._pending_disconnects),
                 'pending_native_cleanup': len(self._retired_clients),
+                'deferred_native_cleanup': list(self._cleanup_retry),
+                'full_service_discovery': sorted(self._full_discovery),
+                'rediscovery_wait_seconds': {m: round(max(0, due-time.monotonic()), 1)
+                                            for m, due in self._rediscover_after.items()},
                 'ble_scan_error': self.last_scan_error,
                 'active_connections': len(self._clients), 'event_history': list(self.history),
                 'gatt_services': self.gatt, 'notification_stats': self.notifications, 'discovered_devices': [
