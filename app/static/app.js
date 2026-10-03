@@ -26,6 +26,7 @@ const statusNames = {
   disabled: "已停用",
 };
 const axisColors = { x: "#55a7ff", y: "#ffbd59", z: "#ba8cff" };
+const deviceNameOrder = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const $ = selector => document.querySelector(selector);
 const fmt = (value, digits = 1) => value === null || value === undefined || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(digits);
 const maxAxis = (sample, prefix) => {
@@ -111,16 +112,11 @@ function renderCards(devices) {
   }
   grid.querySelector(".empty-state")?.remove();
   const queueRank = new Map((state.dashboard?.queue_order || []).map((mac, index) => [mac, index]));
-  const statusRank = { connected: 0, connecting: 1, disconnecting: 2, queued: 3, retrying: 3, paused: 4, disabled: 5 };
   const ordered = [...devices].sort((a, b) => {
-    const aRank = statusRank[a.runtime.status] ?? 5;
-    const bRank = statusRank[b.runtime.status] ?? 5;
-    if (aRank !== bRank) return aRank - bRank;
-    if (aRank === 0) return (a.runtime.handle ?? a.id) - (b.runtime.handle ?? b.id);
-    if (aRank === 3) return (queueRank.get(a.mac) ?? Infinity) - (queueRank.get(b.mac) ?? Infinity);
-    return a.id - b.id;
+    const group = Number(b.runtime.status === "connected") - Number(a.runtime.status === "connected");
+    return group || deviceNameOrder.compare(a.name.trim() || a.mac, b.name.trim() || b.mac) || a.id - b.id;
   });
-  ordered.forEach(device => {
+  ordered.forEach((device, index) => {
     const runtime = device.runtime;
     const live = Boolean(runtime.collecting);
     const sample = runtime.latest;
@@ -157,10 +153,12 @@ function renderCards(devices) {
           <button type="button" class="primary" onclick="openMonitor(${device.id})">实时监控</button>
         </div>
       </div>`;
-      // Existing cards keep their nodes and positions during live updates.
-      // Replacing or moving a hovered button can cancel a mouse click.
+      // Keep existing mouse targets alive during sample updates.
       grid.append(card);
     }
+    // Grid order reflects current names and connection groups without
+    // removing/reinserting card or button nodes during live updates.
+    if (card.style.order !== String(index)) card.style.order = String(index);
     const text = (field, value) => {
       const node = card.querySelector(`[data-field="${field}"]`);
       if (node.textContent !== value) node.textContent = value;

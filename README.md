@@ -2,6 +2,10 @@
 
 面向 WTVB01-BT50 温振传感器和 EW-DTU02 蓝牙转串口网关，目标运行环境为 Windows 11 x64。
 
+## v0.6.17
+
+恢复设备预览页排序：已连接设备在前，未连接设备在后，两组均按设备名称顺序排列，忽略大小写并使用自然数字顺序。连接状态或名称变化时自动更新位置，实时采集刷新仍保留卡片和按钮节点。
+
 ## v0.6.16
 
 根据 `WTVB-diagnostics-v0.6.15` 优化电脑内置蓝牙：定向服务查询失败后改为完整非缓存查询；有空闲名额或待连接设备尚未发现时，保留正常采集链路。释放后冷却、新广播确认和逐台退避共同控制重连，原生释放失败只隔离对应设备。详见 [本版诊断](docs/v0616-field-report.md)。旧版数据与配置可继续使用，实际长期稳定性请按 [现场测试说明](现场测试说明.md) 验证。
@@ -92,7 +96,7 @@
 ## 下载运行
 
 1. 打开 https://github.com/hadooow/wtvb-monitor/releases 。
-2. 在最新版本的 Assets 中下载 `WTVB-Monitor-v0.6.16-windows-x64.zip`。GitHub 自动提供的 `Source code` 是源码，不能直接当作 EXE 运行。
+2. 在最新版本的 Assets 中下载 `WTVB-Monitor-v0.6.17-windows-x64.zip`。GitHub 自动提供的 `Source code` 是源码，不能直接当作 EXE 运行。
 3. 右键 ZIP → 全部解压，建议解压到有写入权限的目录，例如 `D:\WTVB-v0.6.11`。
 4. 打开解压后的 `WTVB-Monitor` 文件夹，双击 `WTVB-Monitor.exe`。保留整个文件夹及 `_internal` 子目录，无需安装 Python。
 5. 程序自动打开 `http://127.0.0.1:8000`；未自动打开时可手动输入。保留程序窗口，关闭窗口会停止采集。
@@ -108,7 +112,7 @@
 
 日志自动开启，无需额外操作。单设备“断开”只暂停本次程序运行中的连接，不等同于在设置里长期停用设备。
 
-- **最方便：** 首页点击“下载诊断日志”，浏览器下载 `WTVB-diagnostics-v0.6.16.zip`。其中含 `diagnostics.json`（版本、配置及状态快照）和 `logs/monitor.log*`。
+- **最方便：** 首页点击“下载诊断日志”，浏览器下载 `WTVB-diagnostics-v0.6.17.zip`。其中含 `diagnostics.json`（版本、配置及状态快照）和 `logs/monitor.log*`。
 - **本地查看：** 打开 EXE 同目录的 `logs\monitor.log`，用记事本或 VS Code 查看。源码运行时位于项目根目录的 `logs`。
 - **实时查看：** 在程序目录打开 PowerShell，执行：
 
@@ -147,7 +151,7 @@ py -3.12 -m venv .venv
 .\build_release.bat
 ```
 
-脚本先运行自动化测试，再用 PyInstaller 打包，复制静态资源及现场配置，在临时副本中自动运行 EXE 验证模拟采集、首页及日志下载。成功后生成 `release\WTVB-Monitor-v0.6.16-windows-x64.zip` 和 SHA256 文件。临时自检数据不会装进发布包。
+脚本先运行自动化测试，再用 PyInstaller 打包，复制静态资源及现场配置，在临时副本中自动运行 EXE 验证模拟采集、首页及日志下载。成功后生成 `release\WTVB-Monitor-v0.6.17-windows-x64.zip` 和 SHA256 文件。临时自检数据不会装进发布包。
 
 ## GitHub 自动发布（维护者）
 

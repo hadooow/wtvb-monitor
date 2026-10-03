@@ -7,6 +7,7 @@ class Node {
   constructor() {
     this.dataset = new Proxy({}, {set(object, key, value) { object[key] = String(value); return true; }});
     this.textContent = ''; this.hidden = false;
+    this.style = {};
   }
 }
 class Card extends Node {
@@ -51,7 +52,33 @@ for (let i = 0; i < 1000; i++) {
 assert.equal(card.fields.get('name').textContent, '<sensor 1>');
 render([device(2), device(3)]);
 assert.deepEqual(grid.children.map(c => Number(c.dataset.deviceId)), [2, 3]);
-console.log('Stable card/button identity, position, value updates, and registration changes passed');
+console.log('Stable card/button identity, value updates, and registration changes passed');
+const named = (id, name, status) => ({ ...device(id, status), name });
+const preview = [named(10, 'cbf10', 'connected'), named(11, 'WTVB', 'connected'),
+  named(12, 'CBF2', 'connected'), named(13, 'B-sensor', 'connecting'),
+  named(14, 'A-sensor', 'retrying'), named(15, 'Z-sensor', 'disabled')];
+preview[0].runtime.handle = 1;
+preview[2].runtime.handle = 99; // connection handle must not determine name order
+const visualOrder = () => [...grid.children].sort((a, b) => Number(a.style.order) - Number(b.style.order))
+  .map(card => Number(card.dataset.deviceId));
+render(preview);
+assert.deepEqual(visualOrder(), [12, 10, 11, 14, 13, 15]);
+const savedCards = new Map(grid.children.map(card => [card.dataset.deviceId, card]));
+for (let i = 0; i < 100; i++) {
+  render([...preview].reverse());
+  assert.deepEqual(visualOrder(), [12, 10, 11, 14, 13, 15]);
+  for (const card of grid.children) assert.equal(card, savedCards.get(card.dataset.deviceId));
+}
+preview[2].runtime.status = 'paused';
+render(preview);
+assert.deepEqual(visualOrder(), [10, 11, 14, 13, 12, 15]);
+preview[2].runtime.status = 'connected';
+preview[0].name = 'Alpha';
+render(preview);
+assert.deepEqual(visualOrder(), [10, 12, 11, 14, 13, 15]);
+// Restore the connection button fixture used below.
+render([device(2), device(3)]);
+console.log('Connected-first alphabetical preview order, numeric names, status changes, and rename passed');
 let release;
 context.pendingResponse = new Promise(resolve => { release = resolve; });
 context.requests = [];
