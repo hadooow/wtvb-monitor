@@ -25,7 +25,8 @@ const statusNames = {
   retrying: "重试中",
   disabled: "已停用",
 };
-const axisColors = { x: "#55a7ff", y: "#ffbd59", z: "#ba8cff" };
+const axisColors = { x: "#ff4545", y: "#35d05b", z: "#4385ff" };
+const chartStates = new WeakMap();
 const deviceNameOrder = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const $ = selector => document.querySelector(selector);
 const fmt = (value, digits = 1) => value === null || value === undefined || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(digits);
@@ -418,7 +419,94 @@ function drawAllCharts(device) {
 }
 
 function axisSeries(prefix) {
-  return ["x", "y", "z"].map(axis => ({ key: `${prefix}_${axis}`, color: axisColors[axis] }));
+  return ["x", "y", "z"].map(axis => ({ key: `${prefix}_${axis}`, label: axis.toUpperCase(), color: axisColors[axis] }));
+}
+
+function chartValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function nearestChartPoint(points, timestamp) {
+  if (!points.length) return null;
+  let low = 0, high = points.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (new Date(points[middle].timestamp).getTime() < timestamp) low = middle + 1;
+    else high = middle;
+  }
+  const before = points[Math.max(0, low - 1)];
+  const after = points[Math.min(points.length - 1, low)];
+  return Math.abs(new Date(before.timestamp).getTime() - timestamp) <= Math.abs(new Date(after.timestamp).getTime() - timestamp) ? before : after;
+}
+
+function chartInteraction(canvas) {
+  let interaction = chartStates.get(canvas);
+  if (interaction) return interaction;
+  const tooltip = document.createElement("div");
+  tooltip.className = "chart-tooltip";
+  tooltip.hidden = true;
+  canvas.parentElement.append(tooltip);
+  interaction = { tooltip, fraction: null, frame: null, drawing: null };
+  chartStates.set(canvas, interaction);
+  const redraw = () => {
+    if (interaction.frame !== null) return;
+    interaction.frame = requestAnimationFrame(() => {
+      interaction.frame = null;
+      const drawing = interaction.drawing;
+      if (drawing && !canvas.closest(".hidden")) drawChart(canvas, drawing.points, drawing.series, drawing.options);
+    });
+  };
+  canvas.addEventListener("pointermove", event => {
+    const drawing = interaction.drawing;
+    if (!drawing) return;
+    const bounds = canvas.getBoundingClientRect();
+    const x = (event.clientX - bounds.left) * drawing.width / bounds.width;
+    const y = (event.clientY - bounds.top) * drawing.height / bounds.height;
+    const { plot } = drawing;
+    interaction.fraction = x >= plot.left && x <= plot.right && y >= plot.top && y <= plot.bottom
+      ? (x - plot.left) / (plot.right - plot.left) : null;
+    if (interaction.fraction === null) tooltip.hidden = true;
+    redraw();
+  });
+  canvas.addEventListener("pointerleave", () => {
+    interaction.fraction = null;
+    tooltip.hidden = true;
+    redraw();
+  });
+  return interaction;
+}
+
+function drawChartCursor(canvas, interaction, ctx, drawing) {
+  const { tooltip, fraction } = interaction;
+  if (fraction === null) { tooltip.hidden = true; return; }
+  const { plot, startTime, endTime, points, series, options, width } = drawing;
+  const timestamp = startTime + fraction * (endTime - startTime);
+  const x = plot.left + fraction * (plot.right - plot.left);
+  ctx.save();
+  ctx.strokeStyle = "rgba(237,247,247,.75)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(x, plot.top); ctx.lineTo(x, plot.bottom); ctx.stroke();
+  ctx.restore();
+  const point = nearestChartPoint(points, timestamp);
+  const lines = [`时间：${new Date(timestamp).toLocaleString()}`];
+  if (point) {
+    lines.push(`最近样本：${new Date(point.timestamp).toLocaleString()}`);
+    for (const item of series) {
+      const value = chartValue(point[item.key]);
+      lines.push(`${item.label || "温度"}：${value === null ? "—" : fmt(value, options.temperature ? 2 : 1)} ${options.unit}`);
+    }
+  } else lines.push("此范围内暂无样本");
+  tooltip.textContent = lines.join("\n");
+  tooltip.hidden = false;
+  const bounds = canvas.getBoundingClientRect();
+  const parent = canvas.parentElement.getBoundingClientRect();
+  const tooltipWidth = tooltip.offsetWidth;
+  const desiredLeft = x + 12 + tooltipWidth <= width ? x + 12 : x - tooltipWidth - 12;
+  tooltip.style.left = `${bounds.left - parent.left + Math.max(0, Math.min(width - tooltipWidth, desiredLeft))}px`;
+  tooltip.style.top = `${bounds.top - parent.top + plot.top + 4}px`;
 }
 
 function drawChart(canvas, points, series, options) {
@@ -436,18 +524,25 @@ function drawChart(canvas, points, series, options) {
   const endTime = options.endTime ?? Date.now();
   const startTime = options.startTime ?? (endTime - state.rangeMinutes * 60000);
   const rangeMinutes = (endTime - startTime) / 60000;
+  points = points.filter(point => {
+    const time = new Date(point.timestamp).getTime();
+    return Number.isFinite(time) && time >= startTime && time <= endTime;
+  });
+  const interaction = chartInteraction(canvas);
+  const drawing = { points, series, options, width, height, plot, startTime, endTime };
+  interaction.drawing = drawing;
   const allValues = [];
   for (const point of points) for (const item of series) {
-    const value = Number(point[item.key]);
-    if (Number.isFinite(value)) allValues.push(value);
+    const value = chartValue(point[item.key]);
+    if (value !== null) allValues.push(value);
   }
 
   ctx.font = '10px "Segoe UI", sans-serif';
   ctx.strokeStyle = "rgba(141,195,207,.13)";
   ctx.fillStyle = "#789399";
   ctx.lineWidth = 1;
-  let min = allValues.length ? Math.min(...allValues) : 0;
-  let max = allValues.length ? Math.max(...allValues) : 1;
+  let min = allValues.length ? allValues.reduce((a, b) => Math.min(a, b)) : 0;
+  let max = allValues.length ? allValues.reduce((a, b) => Math.max(a, b)) : 1;
   if (min === max) { const padding = Math.max(Math.abs(min) * .08, 1); min -= padding; max += padding; }
   else { const padding = (max - min) * .1; min -= padding; max += padding; }
 
@@ -470,6 +565,7 @@ function drawChart(canvas, points, series, options) {
     ctx.fillStyle = "#8fa9ad";
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText("所选时间范围内暂无数据", (plot.left + plot.right) / 2, (plot.top + plot.bottom) / 2);
+    drawChartCursor(canvas, interaction, ctx, drawing);
     return;
   }
 
@@ -478,8 +574,8 @@ function drawChart(canvas, points, series, options) {
   for (const item of series) {
     let previous = null;
     for (const point of points) {
-      const value = Number(point[item.key]);
-      if (!Number.isFinite(value)) { previous = null; continue; }
+      const value = chartValue(point[item.key]);
+      if (value === null) { previous = null; continue; }
       const current = { x: xOf(point), y: yOf(value), value };
       if (previous) {
         ctx.beginPath(); ctx.moveTo(previous.x, previous.y); ctx.lineTo(current.x, current.y);
@@ -491,6 +587,7 @@ function drawChart(canvas, points, series, options) {
       previous = current;
     }
   }
+  drawChartCursor(canvas, interaction, ctx, drawing);
 }
 
 function temperatureColor(value, min, max, thresholds) {
@@ -748,14 +845,21 @@ $("#historyNext").addEventListener("click", async () => {
 });
 
 let rangeTimer;
+async function setLiveRange(minutes) {
+  clearTimeout(rangeTimer);
+  state.rangeMinutes = Math.min(10080, Math.max(1, Number(minutes) || 1));
+  $("#rangeMinutes").value = state.rangeMinutes;
+  const preset = $("#liveRangePreset");
+  preset.value = [...preset.options].some(option => Number(option.value) === state.rangeMinutes) ? String(state.rangeMinutes) : "";
+  await loadHistory();
+  if (state.monitorDeviceId !== null) renderMonitor();
+}
+$("#liveRangePreset").addEventListener("change", event => {
+  if (event.target.value) setLiveRange(Number(event.target.value));
+});
 $("#rangeMinutes").addEventListener("input", event => {
   clearTimeout(rangeTimer);
-  rangeTimer = setTimeout(async () => {
-    const value = Math.min(10080, Math.max(1, Number(event.target.value) || 1));
-    event.target.value = value;
-    state.rangeMinutes = value;
-    await loadHistory();
-  }, 350);
+  rangeTimer = setTimeout(() => setLiveRange(event.target.value), 350);
 });
 
 $("#monitorDialog").addEventListener("close", () => {

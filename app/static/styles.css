@@ -11,6 +11,9 @@
   --amber: #ffbd59;
   --purple: #ba8cff;
   --red: #ff6f69;
+  --axis-x: #ff4545;
+  --axis-y: #35d05b;
+  --axis-z: #4385ff;
   --shadow: 0 20px 50px rgba(0, 0, 0, .28);
 }
 
@@ -143,12 +146,15 @@ select:focus, input:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgb
 .range-toolbar > div span { color: var(--muted); font-size: 11px; }
 .range-input { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .range-input input { width: 96px; }
+.range-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.range-preset { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .axis-legend { display: flex; justify-content: flex-end; gap: 18px; padding: 14px 3px 8px; color: var(--muted); font-size: 12px; }
-.axis-x { background: var(--blue); }
-.axis-y { background: var(--amber); }
-.axis-z { background: var(--purple); }
+.axis-x { background: var(--axis-x); }
+.axis-y { background: var(--axis-y); }
+.axis-z { background: var(--axis-z); }
 .monitor-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.live-chart-card { padding: 15px; background: #09191f; border: 1px solid var(--line); border-radius: 13px; min-width: 0; }
+.live-chart-card { position: relative; padding: 15px; background: #09191f; border: 1px solid var(--line); border-radius: 13px; min-width: 0; }
+.chart-tooltip { position: absolute; z-index: 2; pointer-events: none; white-space: pre-line; max-width: calc(100% - 30px); padding: 9px 11px; border: 1px solid rgba(237,247,247,.35); border-radius: 8px; background: rgba(7,16,21,.96); color: var(--text); font-size: 11px; line-height: 1.55; font-variant-numeric: tabular-nums; box-shadow: 0 5px 16px rgba(0,0,0,.25); }
 .chart-heading { min-height: 48px; display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .chart-heading > div > span:first-child { color: var(--muted); font-size: 12px; display: block; margin-bottom: 5px; }
 .chart-heading > div > strong { font-size: 20px; }

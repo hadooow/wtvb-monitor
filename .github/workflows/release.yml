@@ -21,6 +21,7 @@ jobs:
           node-version: '22'
       - run: node --check app/static/app.js
       - run: node tests/card_dom_regression.cjs
+      - run: node tests/chart_regression.cjs
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

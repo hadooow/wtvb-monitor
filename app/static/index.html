@@ -130,7 +130,17 @@
 
       <div class="range-toolbar">
         <div><strong>图表时间范围</strong><span>始终显示当前时间往前的数据，并自动更新</span></div>
-        <label class="range-input"><input id="rangeMinutes" type="number" min="1" max="10080" value="1"><span>分钟</span></label>
+        <div class="range-controls">
+          <label class="range-preset">快捷范围<select id="liveRangePreset">
+            <option value="1">最近 1 分钟</option><option value="5">最近 5 分钟</option>
+            <option value="10">最近 10 分钟</option><option value="30">最近 30 分钟</option>
+            <option value="60">最近 1 小时</option><option value="180">最近 3 小时</option>
+            <option value="360">最近 6 小时</option><option value="1440">最近 24 小时</option>
+            <option value="4320">最近 3 天</option><option value="7200">最近 5 天</option>
+            <option value="10080">最近 7 天</option><option value="">自定义</option>
+          </select></label>
+          <label class="range-input"><input id="rangeMinutes" type="number" min="1" max="10080" value="1"><span>分钟</span></label>
+        </div>
       </div>
 
       <div class="axis-legend"><span><i class="axis-dot axis-x"></i>X 轴</span><span><i class="axis-dot axis-y"></i>Y 轴</span><span><i class="axis-dot axis-z"></i>Z 轴</span></div>
@@ -164,9 +174,16 @@
           <div class="history-heading"><strong>历史数据</strong><span>最长查询 7 天；趋势图自动均匀抽样，表格按页读取。</span></div>
           <div class="history-controls">
             <div class="history-presets" role="group" aria-label="历史时间范围">
+              <button type="button" class="secondary" data-history-minutes="1">最近 1 分钟</button>
+              <button type="button" class="secondary" data-history-minutes="5">5 分钟</button>
+              <button type="button" class="secondary" data-history-minutes="10">10 分钟</button>
+              <button type="button" class="secondary" data-history-minutes="30">30 分钟</button>
               <button type="button" class="secondary active" data-history-minutes="60">最近 1 小时</button>
+              <button type="button" class="secondary" data-history-minutes="180">3 小时</button>
               <button type="button" class="secondary" data-history-minutes="360">6 小时</button>
               <button type="button" class="secondary" data-history-minutes="1440">24 小时</button>
+              <button type="button" class="secondary" data-history-minutes="4320">3 天</button>
+              <button type="button" class="secondary" data-history-minutes="7200">5 天</button>
               <button type="button" class="secondary" data-history-minutes="10080">7 天</button>
             </div>
             <div class="history-custom">
