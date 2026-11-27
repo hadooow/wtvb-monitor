@@ -7,12 +7,17 @@ import time
 from collections import deque
 from queue import Empty, Queue
 
+from bleak.exc import BleakError
+
 from .gateway import GatewayEvent
 from .protocol import normalize_mac
 
 logger = logging.getLogger(__name__)
 SERVICE_UUID = '0000ffe5-0000-1000-8000-00805f9a34fb'
 NOTIFY_UUID = '0000ffe4-0000-1000-8000-00805f9a34fb'
+TARGETED_UNCACHED = 'targeted_uncached'
+FULL_UNCACHED = 'full_uncached'
+TARGETED_CACHED = 'targeted_cached'
 
 
 class BleGateway:
@@ -47,7 +52,7 @@ class BleGateway:
         self._pending_disconnects = {}
         self._retired_clients = deque()
         self._rediscover_after = {}
-        self._full_discovery = set()
+        self._service_profiles = {}
         self._subscribed = set()
         self._cleanup_retry = {}
 
@@ -257,7 +262,7 @@ class BleGateway:
         ready = False
         stage = 'connect_and_services'
         started_at = time.monotonic()
-        profile = 'full_uncached' if mac in self._full_discovery else 'targeted_uncached'
+        profile = self._service_profiles.get(mac, TARGETED_UNCACHED)
         def disconnected(_client):
             if ready and self._started and (mac, handle) not in self._intentional and self._clients.get(mac) is _client:
                 self._clients.pop(mac, None)
@@ -279,8 +284,8 @@ class BleGateway:
         try:
             self._record('connect_attempt', f'{mac} handle={handle} profile={profile} timeout={self.timeout}s')
             client = self._client_factory(self._devices[mac], pair=False, timeout=self.timeout,
-                                          services=None if mac in self._full_discovery else [SERVICE_UUID],
-                                          winrt={'use_cached_services': False},
+                                          services=None if profile == FULL_UNCACHED else [SERVICE_UUID],
+                                          winrt={'use_cached_services': profile == TARGETED_CACHED},
                                           disconnected_callback=disconnected)
             await asyncio.wait_for(client.connect(), self.timeout)
             stage = 'service_and_characteristic_check'
@@ -298,8 +303,6 @@ class BleGateway:
                 # A UUID-filtered WinRT query can return an empty collection
                 # after reconnect. Recreate the session and enumerate all
                 # services on the next fresh-advertisement attempt.
-                self._full_discovery.add(mac)
-                self._record('service_recovery', f'{mac}; next attempt=full_uncached')
                 raise RuntimeError('BLE_SERVICE_MISMATCH: 未获得 FFE5/FFE4 notify 服务；释放连接并重新扫描后重试')
             self._clients[mac] = client
             self._handles[mac] = handle
@@ -308,6 +311,8 @@ class BleGateway:
             self._subscribed.add(client)
             if not client.is_connected or not self._started:
                 raise RuntimeError('BLE_LINK_LOST during notification subscription')
+            if profile == TARGETED_CACHED:
+                self._service_profiles[mac] = FULL_UNCACHED
             ready = True
             self.events.put(GatewayEvent('connected', mac, handle=handle,
                                          mtu=client.mtu_size, service_count=len(services)))
@@ -316,9 +321,22 @@ class BleGateway:
             raise
         except Exception as exc:
             detail = str(exc) or f'operation exceeded {self.timeout if stage == "connect_and_services" else 10}s'
+            # Bleak 3.0.2 reports WinRT's UNREACHABLE status as BleakError text.
+            # Retry on a new session and keep recovery local to this sensor.
+            unreachable = (stage == 'connect_and_services' and isinstance(exc, BleakError)
+                           and detail == 'Could not get GATT services: Unreachable')
+            next_profile = profile
+            if profile == TARGETED_CACHED or detail.startswith('BLE_SERVICE_MISMATCH:'):
+                next_profile = FULL_UNCACHED
+            elif unreachable:
+                next_profile = TARGETED_CACHED if profile == FULL_UNCACHED else FULL_UNCACHED
+            if next_profile != profile:
+                self._service_profiles[mac] = next_profile
+                self._record('service_recovery', f'{mac} profile={profile}; next attempt={next_profile}')
             self._record('connect_failed', f'{mac} stage={stage} profile={profile} elapsed={time.monotonic()-started_at:.2f}s: {type(exc).__name__}: {detail}')
             if self._started:
-                self.events.put(GatewayEvent('error', mac, handle=handle, message=f'BLE_CONNECT_FAILED stage={stage} profile={profile}: {type(exc).__name__}: {detail}'))
+                next_attempt = f'; next_profile={next_profile}' if next_profile != profile else ''
+                self.events.put(GatewayEvent('error', mac, handle=handle, message=f'BLE_CONNECT_FAILED stage={stage} profile={profile}: {type(exc).__name__}: {detail}{next_attempt}'))
         finally:
             self._connecting.pop(mac, None)
             if not ready and client is not None:
@@ -396,7 +414,9 @@ class BleGateway:
                 'pending_disconnects': list(self._pending_disconnects),
                 'pending_native_cleanup': len(self._retired_clients),
                 'deferred_native_cleanup': list(self._cleanup_retry),
-                'full_service_discovery': sorted(self._full_discovery),
+                'full_service_discovery': sorted(mac for mac, profile in self._service_profiles.items()
+                                                 if profile == FULL_UNCACHED),
+                'service_profiles': dict(self._service_profiles),
                 'rediscovery_wait_seconds': {m: round(max(0, due-time.monotonic()), 1)
                                             for m, due in self._rediscover_after.items()},
                 'ble_scan_error': self.last_scan_error,

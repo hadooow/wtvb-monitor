@@ -40,6 +40,9 @@ function errorText(value) {
   if (value.includes("SERIAL_BLUETOOTH_PORT")) return "所选 COM 口是蓝牙虚拟串口，请选择 USB 网关端口或切换电脑蓝牙直连";
   if (value.includes("SERIAL_PORT_SELECTION")) return "请在采集设置中选择实际 USB 网关串口";
   if (value.includes("BLE_SERVICE_MISMATCH")) return "电脑已连接，但未找到 FFE5/FFE4 数据服务，请下载诊断核对";
+  if (value.includes("Could not get GATT services: Unreachable") && value.includes("next_profile=")) {
+    return "Windows 暂时读不到传感器的蓝牙服务，将在收到新广播后换一种方式重试";
+  }
   if (value.includes("BLE_CONNECT_FAILED")) return `电脑蓝牙连接失败 · ${value}`;
   if (value.includes("SERIAL_IO_ERROR")) return "串口读取或写入失败，正在自动重连网关";
   const profile = value.includes(" | ") ? ` · 已尝试${value.split(" | ").slice(1).join(" | ")}` : "";

@@ -3,6 +3,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from bleak.exc import BleakError
 
 from app.ble_gateway import BleGateway, SERVICE_UUID
 from app.gateway import GatewayEvent
@@ -60,6 +61,71 @@ def test_empty_filtered_service_query_switches_profile_and_keeps_working(monkeyp
         assert g.poll()[-1].kind == 'connected'
         assert clients[-1].options['services'] is None
         assert g.diagnostics()['full_service_discovery'] == [MAC]
+        await g.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('cached_outcome', ['success', 'missing_notify', 'subscribe_fails'])
+def test_winrt_unreachable_recovers_on_new_session_without_disconnecting_peer(monkeypatch, cached_outcome):
+    clock = [100.0]
+    monkeypatch.setattr('app.ble_gateway.time.monotonic', lambda: clock[0])
+    clients = []
+    peer = SimpleNamespace(address=MACS[1], name='healthy peer')
+
+    class WinRTUnreachable(Client):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            clients.append(self)
+
+        async def connect(self):
+            if self.device is DEVICE and not self.options['winrt']['use_cached_services']:
+                raise BleakError('Could not get GATT services: Unreachable')
+            await super().connect()
+            if self.device is DEVICE and cached_outcome == 'missing_notify':
+                self.services[0].characteristics[0].properties = ['read']
+
+        async def start_notify(self, char, callback):
+            if self.device is DEVICE and cached_outcome == 'subscribe_fails':
+                raise BleakError('Could not start notify: Unreachable')
+            await super().start_notify(char, callback)
+
+    async def run():
+        g = gateway(WinRTUnreachable)
+        advertise(g, peer)
+        g.connect(MACS[1])
+        await finish(g)
+        g.poll()
+        peer_client = g._clients[MACS[1]]
+        for previous_services, next_profile in [([SERVICE_UUID], 'full_uncached'), (None, 'targeted_cached')]:
+            g.connect(MAC)
+            await finish(g)
+            assert f'next_profile={next_profile}' in g.poll()[-1].message
+            assert clients[-1].disconnects == 1
+            assert clients[-1].options['services'] == previous_services
+            assert clients[-1].options['winrt']['use_cached_services'] is False
+            clock[0] += 5
+            advertise(g)
+            clock[0] += 6
+            assert not g.discovered(MAC)
+            advertise(g)
+            g.poll()
+
+        g.connect(MAC)
+        await finish(g)
+        cached = clients[-1]
+        assert cached.options['winrt']['use_cached_services'] is True
+        assert cached.options['services'] == [SERVICE_UUID]
+        if cached_outcome == 'success':
+            assert g.poll()[-1].kind == 'connected'
+            cached.notify(None, b'new sample')
+            assert g.poll()[-1].payload == b'new sample'
+        else:
+            assert g.poll()[-1].kind == 'error'
+            assert MAC not in g.active_links and cached.disconnects == 1
+        assert g.diagnostics()['service_profiles'] == {MAC: 'full_uncached'}
+        assert g.diagnostics()['full_service_discovery'] == [MAC]
+        assert peer_client.disconnects == 0 and MACS[1] in g.active_links
         await g.aclose()
 
     asyncio.run(run())
